@@ -1,15 +1,20 @@
+import os
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-# ─── Bot Client (fill credentials later) ──────────────────────
+# ─── Read credentials from environment variables ──────────────
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+
 app = Client(
     name="userbot",
-    api_id=0,        # will fill later
-    api_hash="",     # will fill later
-    bot_token="",    # will fill later
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
 )
 
-# ─── Start Photo (file_id or URL — admin can change later) ────
+# ─── Start Photo (file_id — admin can change later) ───────────
 START_PHOTO = ""  # leave empty for now, set file_id after first upload
 
 # ─── Start Message & Quote ────────────────────────────────────
