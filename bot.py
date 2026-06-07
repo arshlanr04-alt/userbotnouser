@@ -1,12 +1,20 @@
-import os
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+import asyncio
+from pyrogram import Client
+from config import API_ID, API_HASH, BOT_TOKEN
+from database import db
+from plugins.start import register_start_handler
+from plugins.admin import register_admin_handler
 
-# ─── Read credentials from environment variables ──────────────
-API_ID = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
+print("""
+╔══════════════════════════════════════════════╗
+║      🤖 ADVANCED FORWARD BOT                ║
+║      ─────────────────────────               ║
+║      Powered by Pyrogram + PostgreSQL        ║
+╚══════════════════════════════════════════════╝
+""")
+
+# ─── Initialize Pyrogram Client ──────────────────────────────────
 app = Client(
     name="userbot",
     api_id=API_ID,
@@ -14,73 +22,38 @@ app = Client(
     bot_token=BOT_TOKEN,
 )
 
-# ─── Start Photo (file_id — admin can change later) ───────────
-START_PHOTO = ""  # leave empty for now, set file_id after first upload
-
-# ─── Start Message & Quote ────────────────────────────────────
-START_MESSAGE = "✨ <b>HI {mention} WELCOME TO OUR BOT</b> 👋"
-
-START_QUOTE = (
-    "🍥 <b>I'M AN ADVANCED FORWARD BOT "
-    "WITH SPECIAL FEATURES</b>\n\n"
-    "⚡ <b>CLICK THE BUTTONS BELOW TO "
-    "EXPLORE MORE</b>"
-)
-
-# ─── Inline Buttons Layout (matching the screenshot) ──────────
-START_BUTTONS = InlineKeyboardMarkup(
-    [
-        [
-            InlineKeyboardButton("🏠 Home", callback_data="home"),
-        ],
-        [
-            InlineKeyboardButton("📚 Help", callback_data="help"),
-            InlineKeyboardButton("ℹ️ About", callback_data="about"),
-        ],
-        [
-            InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
-            InlineKeyboardButton("📊 Status", callback_data="status"),
-        ],
-        [
-            InlineKeyboardButton("🔗 How to Use", callback_data="how_to_use"),
-        ],
-    ]
-)
+# ─── Register Handlers ──────────────────────────────────────────
+register_start_handler(app)
+register_admin_handler(app)
 
 
-# ─── /start Command ──────────────────────────────────────────
-@app.on_message(filters.command("start") & filters.private)
-async def start_handler(client, message):
-    user = message.from_user
-    first_name = user.first_name or "User"
-    mention = f'<a href="tg://user?id={user.id}">{first_name}</a>'
+async def main():
+    """Main entry point — connect DB and start the bot."""
+    # Connect to PostgreSQL
+    await db.connect()
 
-    # Build the full message: welcome + quoted block
-    text = START_MESSAGE.replace("{mention}", mention)
-    text += f"\n\n<blockquote>{START_QUOTE}</blockquote>"
+    # Start the bot
+    print("🚀 Bot is starting...")
+    await app.start()
 
-    if START_PHOTO:
-        await message.reply_photo(
-            photo=START_PHOTO,
-            caption=text,
-            reply_markup=START_BUTTONS,
-            parse_mode="html",
-        )
-    else:
-        await message.reply_text(
-            text=text,
-            reply_markup=START_BUTTONS,
-            parse_mode="html",
-            disable_web_page_preview=True,
-        )
+    user = await app.get_me()
+    print(f"✅ Bot started as @{user.username} ({user.first_name})")
+    print(f"📡 Listening for messages...")
+    print(f"─────────────────────────────────────")
+    print(f"Admin Commands:")
+    print(f"  /setphoto    — Set start photo")
+    print(f"  /setwelcome  — Set welcome message")
+    print(f"  /setquote    — Set quote message")
+    print(f"  /clearphoto  — Remove start photo")
+    print(f"  /preview     — Preview start message")
+    print(f"─────────────────────────────────────")
+
+    # Keep the bot running
+    await asyncio.Event().wait()
 
 
-# ─── Button Clicks (placeholder) ─────────────────────────────
-@app.on_callback_query()
-async def button_handler(client, callback_query):
-    await callback_query.answer("🔜 Coming soon!", show_alert=True)
-
-
-# ─── Run ──────────────────────────────────────────────────────
-print("🤖 Bot starting...")
-app.run()
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🔴 Bot stopped.")
