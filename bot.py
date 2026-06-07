@@ -3,16 +3,16 @@ from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 # ─── Read credentials from environment variables ──────────────
-# API_ID = int(os.environ.get("API_ID", 0))
-# API_HASH = os.environ.get("API_HASH", "")
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 
-# app = Client(
-#     name="userbot",
-#     api_id=API_ID,
-#     api_hash=API_HASH,
-#     bot_token=BOT_TOKEN,
-# )
+app = Client(
+    name="userbot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+)
 
 # ─── Start Photo (file_id — admin can change later) ───────────
 START_PHOTO = ""  # leave empty for now, set file_id after first upload
