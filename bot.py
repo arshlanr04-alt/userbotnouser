@@ -1774,8 +1774,11 @@ async def _start_userbot_unlocked():
             device_model="PC 64bit",
             system_version="Windows 11",
             app_version="4.11.2",
-            sequential_updates=True
+            sequential_updates=True,
+            receive_updates=True
         )
+        # Dissociate connection catchup loops entirely
+        userbot.catch_up = False
         await userbot.connect()
         # Cache user identity for synchronous access in UI
         userbot._me = await userbot.get_me()
@@ -2375,6 +2378,15 @@ def setup_automation_handlers(client: TelegramClient):
     async def auto_handler(event):
         m = event.message
         if not m: return
+
+        # FAST DROP: Immediately ignore messages if the source chat isn't in configured pairs
+        # This prevents unconfigured active channels from flooding your CPU loop
+        configured_pairs = get_target_pairs()
+        configured_sources = {str(p[1]).replace("-100", "") for p in configured_pairs}
+        
+        current_chat_str = str(event.chat_id).replace("-100", "")
+        if current_chat_str not in configured_sources and not event.is_private:
+            return # Drop execution immediately before hitting locks or networks
 
         # Ensure client._me is cached
         if not hasattr(client, '_me') or not client._me:
@@ -4662,7 +4674,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     )
                 except Exception:
                     pass
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(1.0)
             
         if not running_tasks.get(task_key):
             bot.send_message(admin_chat_id, f"🛑 History scrape for `{s_title}` stopped by user.")
@@ -5140,7 +5152,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     )
                 except Exception:
                     pass
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(1.0)
 
         if not running_tasks.get(task_key):
             bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user.")
