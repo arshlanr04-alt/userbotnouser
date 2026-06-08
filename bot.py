@@ -4731,7 +4731,62 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     else:
                         await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None)
                 else:
-                    await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid)
+                    try:
+                        src_peer = await userbot.get_input_entity(int(sid))
+                        tgt_peer = await userbot.get_input_entity(int(tid))
+                        dest_topic_id = t_topic
+                        if is_mir:
+                            first_msg = batch[0]
+                            s_top = None
+                            if first_msg.reply_to:
+                                s_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
+                            if s_top:
+                                mapped_topic = get_topic_mapping(sid, s_top, tid)
+                                if mapped_topic:
+                                    dest_topic_id = mapped_topic
+                                else:
+                                    forum = getattr(first_msg.reply_to, "forum_topic", None)
+                                    src_title = getattr(forum, "title", None)
+                                    src_icon = None
+                                    if not src_title:
+                                        try:
+                                            res = await userbot(functions.messages.GetForumTopicsRequest(
+                                                peer=src_peer, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                            ))
+                                            for t in res.topics:
+                                                if t.id == s_top:
+                                                    src_title = t.title
+                                                    src_icon = getattr(t, "icon_emoji_id", None)
+                                                    break
+                                        except Exception: pass
+                                    if src_title:
+                                        dest_topic_id = await get_or_create_target_topic(userbot, tid, src_title, sid, s_top, icon_emoji_id=src_icon)
+
+                        import random
+                        random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in batch]
+                        target_entity = await resolve_target_id(userbot, tid)
+                        is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
+                        top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
+                        
+                        fwd_res = await userbot(functions.messages.ForwardMessagesRequest(
+                            from_peer=src_peer,
+                            id=[msg.id for msg in batch],
+                            to_peer=target_entity,
+                            random_id=random_ids,
+                            top_msg_id=top_msg_id_val
+                        ))
+                        if fwd_res:
+                            fwd_msgs = []
+                            if hasattr(fwd_res, 'updates'):
+                                for u in fwd_res.updates:
+                                    if type(u).__name__ in ["UpdateNewMessage", "UpdateNewChannelMessage"]:
+                                        fwd_msgs.append(u.message)
+                            if len(fwd_msgs) == len(batch):
+                                for orig_m, fwd_m in zip(batch, fwd_msgs):
+                                    save_message_mapping(sid, orig_m.id, tid, fwd_m.id)
+                    except Exception as fwd_err:
+                        logger.error(f"Native Forward in history scrape failed ({fwd_err}). Falling back to mirror...")
+                        await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid)
                 
                 sent_count += len(batch)
                 
@@ -5128,8 +5183,64 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                 await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None)
                                 sent_count += len(matching_batch)
                         else:
-                            await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid)
-                            sent_count += len(matching_batch)
+                            try:
+                                src_peer = await userbot.get_input_entity(int(sid))
+                                tgt_peer = await userbot.get_input_entity(int(tid))
+                                dest_topic_id = t_topic
+                                if auto_mirror:
+                                    first_msg = matching_batch[0]
+                                    s_top = None
+                                    if first_msg.reply_to:
+                                        s_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
+                                    if s_top:
+                                        mapped_topic = get_topic_mapping(sid, s_top, tid)
+                                        if mapped_topic:
+                                            dest_topic_id = mapped_topic
+                                        else:
+                                            forum = getattr(first_msg.reply_to, "forum_topic", None)
+                                            src_title = getattr(forum, "title", None)
+                                            src_icon = None
+                                            if not src_title:
+                                                try:
+                                                    res = await userbot(functions.messages.GetForumTopicsRequest(
+                                                        peer=src_peer, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                                    ))
+                                                    for t in res.topics:
+                                                        if t.id == s_top:
+                                                            src_title = t.title
+                                                            src_icon = getattr(t, "icon_emoji_id", None)
+                                                            break
+                                                except Exception: pass
+                                            if src_title:
+                                                dest_topic_id = await get_or_create_target_topic(userbot, tid, src_title, sid, s_top, icon_emoji_id=src_icon)
+
+                                import random
+                                random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in matching_batch]
+                                target_entity = await resolve_target_id(userbot, tid)
+                                is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
+                                top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
+                                
+                                fwd_res = await userbot(functions.messages.ForwardMessagesRequest(
+                                    from_peer=src_peer,
+                                    id=[msg.id for msg in matching_batch],
+                                    to_peer=target_entity,
+                                    random_id=random_ids,
+                                    top_msg_id=top_msg_id_val
+                                ))
+                                if fwd_res:
+                                    fwd_msgs = []
+                                    if hasattr(fwd_res, 'updates'):
+                                        for u in fwd_res.updates:
+                                            if type(u).__name__ in ["UpdateNewMessage", "UpdateNewChannelMessage"]:
+                                                fwd_msgs.append(u.message)
+                                    if len(fwd_msgs) == len(matching_batch):
+                                        for orig_m, fwd_m in zip(matching_batch, fwd_msgs):
+                                            save_message_mapping(sid, orig_m.id, tid, fwd_m.id)
+                                sent_count += len(matching_batch)
+                            except Exception as fwd_err:
+                                logger.error(f"Native Forward in collection failed ({fwd_err}). Falling back to mirror...")
+                                await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid)
+                                sent_count += len(matching_batch)
                     except Exception as fe:
                         logger.error(f"Failed to forward batch: {fe}")
                         opts["skipped"] += len(matching_batch)
