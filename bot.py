@@ -5682,7 +5682,7 @@ async def userbot_watchdog():
                 await userbot.get_me()
             except Exception as e:
                 err_msg = str(e).lower()
-                if "deactivated" in err_msg or "authorized" in err_msg or "simultaneous" in err_msg or "ip address" in err_msg:
+                if isinstance(e, errors.UnauthorizedError) or any(x in err_msg for x in ["deactivated", "authorized", "revoked", "simultaneous", "ip address"]):
                     logger.warning(f"WATCHDOG: Userbot session invalid or conflict: {e}")
                     try: await userbot.disconnect()
                     except Exception: pass
@@ -5694,7 +5694,7 @@ async def userbot_watchdog():
                         c.execute("DELETE FROM settings WHERE key IN ('session_string', 'api_id', 'api_hash')")
                     logger.info("WATCHDOG: Session cleared from DB due to conflict/invalidation.")
                     
-                    bot.send_message(ADMIN_ID, f"⚠️ *USERBOT SESSION EXPIRED/BANNED*\n\nThe account has been deactivated or unauthorized. Session has been cleared.\nError: `{e}`", parse_mode="Markdown")
+                    bot.send_message(ADMIN_ID, f"⚠️ *USERBOT SESSION EXPIRED/BANNED*\n\nThe account session has been deactivated, revoked, or unauthorized. Session has been cleared.\nError: `{e}`", parse_mode="Markdown")
                 else:
                     logger.error(f"WATCHDOG: Unexpected error: {e}")
         
