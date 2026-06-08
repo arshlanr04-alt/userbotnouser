@@ -2987,10 +2987,15 @@ def cmd_extract_media(message):
         if len(args) < 2: 
             return bot.reply_to(message, "💡 *Usage:* `/extract [message_id]`\n\nFind the ID in your collected logs.", parse_mode="Markdown")
         
-        smid = args[1]
+        try:
+            smid = int(args[1])
+        except ValueError:
+            return bot.reply_to(message, "❌ Message ID must be a valid number.")
+            
         with db_conn() as conn:
             c = conn.cursor()
-            c.execute("SELECT file_id, media_type FROM media_logs WHERE source_message_id = %s LIMIT 1", (smid,))
+            p = get_placeholder(conn)
+            c.execute(f"SELECT file_id, media_type FROM media_logs WHERE source_message_id = {p} LIMIT 1", (smid,))
             res = c.fetchone()
         
         if res:
@@ -5344,6 +5349,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                         c = conn.cursor()
                         p = get_placeholder()
                         c.execute(f"UPDATE collected_media SET released = 2 WHERE id = {p}", (row_id,))
+                        conn.commit()
                     continue
 
                 # --- CONTENT FILTERING ---
@@ -5354,12 +5360,14 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                         c = conn.cursor()
                         p = get_placeholder()
                         c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                        conn.commit()
                     continue
                 if cf == "text" and msg.media:
                     with db_conn() as conn:
                         c = conn.cursor()
                         p = get_placeholder()
                         c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                        conn.commit()
                     continue
 
                 # --- DYNAMIC RELEASE FILTERING ---
@@ -5503,6 +5511,7 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                         c = conn.cursor()
                         p = get_placeholder()
                         c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                        conn.commit()
                 sent += 1
                 if sent % 5 == 0:
                     try: bot.edit_message_text(f"🚀 Releasing `{s_title}` ({category_name})...\n🎯 Filter: `{display_filter}`\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)
@@ -5733,8 +5742,13 @@ class LogBotManager:
                 fetch_id = args[1]
                 with db_conn() as conn:
                     c = conn.cursor()
-                    # Use %s for PostgreSQL
-                    c.execute("SELECT file_id, media_type, caption FROM log_media WHERE log_msg_id = %s AND bot_id = %s", (fetch_id, bot_id))
+                    p = get_placeholder(conn)
+                    try:
+                        f_id_val = int(fetch_id)
+                    except ValueError:
+                        bot_instance.reply_to(message, "❌ Invalid ID format. Must be a number.")
+                        return
+                    c.execute(f"SELECT file_id, media_type, caption FROM log_media WHERE log_msg_id = {p} AND bot_id = {p}", (f_id_val, bot_id))
                     res = c.fetchone()
                 if res:
                     file_id, m_type, caption = res
@@ -5756,7 +5770,8 @@ class LogBotManager:
                 if count > 30: count = 30 
                 with db_conn() as conn:
                     c = conn.cursor()
-                    c.execute("SELECT file_id, media_type, caption, log_msg_id FROM log_media WHERE bot_id = %s ORDER BY timestamp DESC LIMIT %s", (bot_id, count))
+                    p = get_placeholder(conn)
+                    c.execute(f"SELECT file_id, media_type, caption, log_msg_id FROM log_media WHERE bot_id = {p} ORDER BY timestamp DESC LIMIT {p}", (bot_id, count))
                     results = c.fetchall()
                 if not results:
                     bot_instance.reply_to(message, "🔍 Vault empty.")
@@ -5775,12 +5790,12 @@ class LogBotManager:
             if message.from_user.id != ADMIN_ID: return
             with db_conn() as conn:
                 c = conn.cursor()
-                # Correct GROUP BY for PostgreSQL
-                c.execute("""
+                p = get_placeholder(conn)
+                c.execute(f"""
                     SELECT m.source_chat_id, p.source_title, COUNT(m.id)
                     FROM log_media m
                     LEFT JOIN target_pairs p ON m.source_chat_id = p.source_id
-                    WHERE m.bot_id = %s
+                    WHERE m.bot_id = {p}
                     GROUP BY m.source_chat_id, p.source_title
                 """, (bot_id,))
                 groups = c.fetchall()
@@ -5802,7 +5817,8 @@ class LogBotManager:
                 group_id, count = int(args[1]), (int(args[2]) if len(args) > 2 else 5)
                 with db_conn() as conn:
                     c = conn.cursor()
-                    c.execute("SELECT file_id, media_type, caption, log_msg_id FROM log_media WHERE source_chat_id = %s AND bot_id = %s ORDER BY timestamp DESC LIMIT %s", (group_id, bot_id, count))
+                    p = get_placeholder(conn)
+                    c.execute(f"SELECT file_id, media_type, caption, log_msg_id FROM log_media WHERE source_chat_id = {p} AND bot_id = {p} ORDER BY timestamp DESC LIMIT {p}", (group_id, bot_id, count))
                     results = c.fetchall()
                 for f_id, m_t, cap, l_id in reversed(results):
                     bot_instance.send_photo(message.chat.id, f_id, caption=f"🆔 ID: `{l_id}`\n{cap or ''}") if m_t == "photo" else bot_instance.send_document(message.chat.id, f_id, caption=f"🆔 ID: `{l_id}`")
@@ -5816,13 +5832,7 @@ class LogBotManager:
                 c = conn.cursor()
                 p = get_placeholder(conn)
                 
-                # Use standard string formatting for the query to avoid "end of input" errors
-                # Ensure sid is passed as a tuple (sid,)
-                if USING_POSTGRES:
-                    c.execute("SELECT source_title FROM target_pairs WHERE source_id = %s LIMIT 1", (sid,))
-                else:
-                    c.execute("SELECT source_title FROM target_pairs WHERE source_id = ? LIMIT 1", (sid,))
-                
+                c.execute(f"SELECT source_title FROM target_pairs WHERE source_id = {p} LIMIT 1", (sid,))
                 res = c.fetchone()
                 title = res[0] if res else "Unknown Group"
                 
