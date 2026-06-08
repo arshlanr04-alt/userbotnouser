@@ -4593,7 +4593,6 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
     try:
         # Force peer resolution (Anti PeerIdInvalid)
         target_chat = await resolve_target_id(userbot, sid)
-        sid_resolved = target_chat.id
         
         # Telethon uses iter_messages for history (newest to oldest)
         target_topic = None
@@ -4606,7 +4605,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
         # Collect matching messages first
         collected_messages = []
         
-        async for m in userbot.iter_messages(sid_resolved, reply_to=target_topic):
+        async for m in userbot.iter_messages(target_chat, reply_to=target_topic):
             if not running_tasks.get(task_key):
                 break
             
@@ -4617,7 +4616,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                 continue
             if start_date and m.date < start_date:
                 break # Since we go newest to oldest, anything before start_date means we are done
-
+ 
             # Ban list check
             sender_id = m.sender_id
             sender_username = getattr(m.sender, 'username', None)
@@ -4725,9 +4724,9 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     if has_media and not any(msg.id in media_to_file for msg in batch):
                         logger.warning("🛡️ SCRAPE: Skipping mirror because media download failed/skipped.")
                     else:
-                        await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid_resolved, pre_downloaded=[media_to_file[msg.id] for msg in batch if msg.id in media_to_file] if (is_protected_flow and has_media) else None)
+                        await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None)
                 else:
-                    await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid_resolved)
+                    await send_mirrored_content(userbot, tid, batch, t_topic, is_mir, sid)
                 
                 sent_count += len(batch)
                 
@@ -4752,7 +4751,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                                             released = EXCLUDED.released,
                                             timestamp = CURRENT_TIMESTAMP
                                         """,
-                                        (pair_id, sid_resolved, m.id, m_type, m.message or "")
+                                        (pair_id, sid, m.id, m_type, m.message or "")
                                     )
                                 else:
                                     c.execute(
@@ -4768,7 +4767,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                                             released = excluded.released,
                                             timestamp = datetime('now')
                                         """,
-                                        (pair_id, sid_resolved, m.id, m_type, m.message or "")
+                                        (pair_id, sid, m.id, m_type, m.message or "")
                                     )
                         if not USING_POSTGRES or not DATABASE_URL:
                             conn.commit()
@@ -4778,7 +4777,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                         if files_to_vault:
                             file_payload = files_to_vault if len(files_to_vault) > 1 else files_to_vault[0]
                             for token, username, bot_id in get_log_bots():
-                                metadata = f"SID: {sid_resolved} | MID: {batch[0].id}\n"
+                                metadata = f"SID: {sid} | MID: {batch[0].id}\n"
                                 caption_text = metadata + (batch[0].message or "")
                                 try:
                                     vaulted_result = await userbot.send_message(
@@ -4793,7 +4792,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                                             save_logged_media(
                                                 bot_id=int(bot_id),
                                                 log_msg_id=int(v_m.id),
-                                                source_chat_id=int(sid_resolved),
+                                                source_chat_id=int(sid),
                                                 source_msg_id=int(orig_m.id),
                                                 file_id=None,
                                                 media_type=type(orig_m.media).__name__ if orig_m.media else "text",
@@ -4803,7 +4802,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                                 except Exception as e:
                                     logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
                     else:
-                        asyncio.create_task(forward_to_log_bots(userbot, batch, sid_resolved))
+                        asyncio.create_task(forward_to_log_bots(userbot, batch, sid))
             finally:
                 for temp_path in media_to_file.values():
                     if os.path.exists(temp_path):
@@ -4884,7 +4883,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         
     # Initialize collection options default state
     collection_options[task_key] = {
-        "instant_release": False,
+        "instant_release": bool(is_live),  # Default to pair's live status
         "instant_filter": "everything",
         "collect_filter": default_cf,
         "s_title": s_title,
@@ -4910,10 +4909,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
     try:
         # Force peer resolution (Anti PeerIdInvalid)
         source_chat = await resolve_target_id(userbot, sid)
-        sid_resolved = source_chat.id
-        
         dest_chat = await resolve_target_id(userbot, tid)
-        tid_resolved = dest_chat.id
         
         # Telethon uses iter_messages for history (newest to oldest)
         target_topic = None
@@ -4928,7 +4924,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         # Query total count for accurate progress calculation
         total_count = 0
         try:
-            total_msg = await userbot.get_messages(sid_resolved, limit=0)
+            total_msg = await userbot.get_messages(source_chat, limit=0)
             total_count = total_msg.total
         except Exception as e:
             logger.warning(f"Could not get total message count: {e}")
@@ -4940,7 +4936,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         opts = collection_options.setdefault(task_key, {})
         opts["status"] = "Fetching"
         
-        async for m in userbot.iter_messages(sid_resolved, limit=limit, reply_to=target_topic, reverse=True):
+        async for m in userbot.iter_messages(source_chat, limit=limit, reply_to=target_topic, reverse=True):
             if not running_tasks.get(task_key):
                 break
             
@@ -4978,7 +4974,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 with db_conn() as conn:
                     c = conn.cursor()
                     p = get_placeholder()
-                    c.execute(f"SELECT 1 FROM collected_media WHERE source_chat_id = {p} AND source_message_id = {p}", (sid_resolved, m.id))
+                    c.execute(f"SELECT 1 FROM collected_media WHERE source_chat_id = {p} AND source_message_id = {p}", (sid, m.id))
                     is_dup = c.fetchone() is not None
             except Exception as dbe:
                 logger.error(f"Error checking duplicate: {dbe}")
@@ -5124,10 +5120,10 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                 logger.warning("🛡️ COLLECTION: Skipping mirror because media download failed/skipped.")
                                 opts["skipped"] += len(matching_batch)
                             else:
-                                await send_mirrored_content(userbot, tid_resolved, matching_batch, t_topic, auto_mirror, sid_resolved, pre_downloaded=[media_to_file[msg.id] for msg in matching_batch if msg.id in media_to_file] if (is_protected_flow and has_media) else None)
+                                await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None)
                                 sent_count += len(matching_batch)
                         else:
-                            await send_mirrored_content(userbot, tid_resolved, matching_batch, t_topic, auto_mirror, sid_resolved)
+                            await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid)
                             sent_count += len(matching_batch)
                     except Exception as fe:
                         logger.error(f"Failed to forward batch: {fe}")
@@ -5163,7 +5159,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                     released = EXCLUDED.released,
                                     timestamp = CURRENT_TIMESTAMP
                                 """,
-                                (pair_id, sid_resolved, m.id, m_type, m.message or "", rel_val)
+                                (pair_id, sid, m.id, m_type, m.message or "", rel_val)
                             )
                         else:
                             c.execute(
@@ -5179,7 +5175,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                     released = excluded.released,
                                     timestamp = datetime('now')
                                 """,
-                                (pair_id, sid_resolved, m.id, m_type, m.message or "", rel_val)
+                                (pair_id, sid, m.id, m_type, m.message or "", rel_val)
                             )
                     conn.commit()
                 # 3. Send to log bots (through Vault) if instant release is active and matching_batch exists
@@ -5190,7 +5186,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                         if files_to_vault:
                             file_payload = files_to_vault if len(files_to_vault) > 1 else files_to_vault[0]
                             for token, username, bot_id in get_log_bots():
-                                metadata = f"SID: {sid_resolved} | MID: {matching_batch[0].id}\n"
+                                metadata = f"SID: {sid} | MID: {matching_batch[0].id}\n"
                                 caption_text = metadata + (matching_batch[0].message or "")
                                 try:
                                     vaulted_result = await userbot.send_message(
@@ -5205,7 +5201,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                             save_logged_media(
                                                 bot_id=int(bot_id),
                                                 log_msg_id=int(v_m.id),
-                                                source_chat_id=int(sid_resolved),
+                                                source_chat_id=int(sid),
                                                 source_msg_id=int(orig_m.id),
                                                 file_id=None,
                                                 media_type=type(orig_m.media).__name__ if orig_m.media else "text",
@@ -5215,7 +5211,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                 except Exception as e:
                                     logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
                     else:
-                        asyncio.create_task(forward_to_log_bots(userbot, matching_batch, sid_resolved))
+                        asyncio.create_task(forward_to_log_bots(userbot, matching_batch, sid))
             finally:
                 for temp_path in media_to_file.values():
                     if os.path.exists(temp_path):
