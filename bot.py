@@ -1166,6 +1166,7 @@ def get_all_vault_stats():
 # -----------------------------
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 userbot = None
+userbot_init_lock = asyncio.Lock()
 
 admin_states = {}
 login_data = {} # Temporary storage for login steps
@@ -1738,7 +1739,7 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
         logger.error(f"Mirroring Error (get_or_create): {e}")
         return None
 
-async def start_userbot():
+async def _start_userbot_unlocked():
     global userbot
     api_id = get_setting("api_id")
     api_hash = get_setting("api_hash")
@@ -1769,21 +1770,26 @@ async def start_userbot():
     except Exception as e:
         return False, str(e)
 
+async def start_userbot():
+    async with userbot_init_lock:
+        return await _start_userbot_unlocked()
+
 async def ensure_userbot():
     """Ensures the userbot is connected and ready."""
     global userbot
-    if not userbot:
-        ok, msg = await start_userbot()
-        if not ok: return False, msg
-    
-    if not userbot.is_connected():
-        try: 
-            await userbot.connect()
-            setup_automation_handlers(userbot)
-        except Exception as e: 
-            return False, f"Connection failed: {e}"
-    
-    return True, "Connected"
+    async with userbot_init_lock:
+        if not userbot:
+            ok, msg = await _start_userbot_unlocked()
+            if not ok: return False, msg
+        
+        if not userbot.is_connected():
+            try: 
+                await userbot.connect()
+                setup_automation_handlers(userbot)
+            except Exception as e: 
+                return False, f"Connection failed: {e}"
+        
+        return True, "Connected"
 
 async def forward_to_log_bots(client, messages, source_chat_id):
     """Sends collected content (single or album) to all registered log bots."""
@@ -1802,10 +1808,7 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
         first_msg = messages[0]
         
         # RESOLVE ENTITY
-        try:
-            target_peer = await client.get_input_entity(int(log_chat_id))
-        except Exception:
-            target_peer = await client.get_entity(int(log_chat_id))
+        target_peer = await resolve_target_id(client, log_chat_id)
 
         # Metadata for Log Bot extraction (only on the first message of album if multiple)
         metadata = f"SID: {source_chat_id} | MID: {first_msg.id}\n"
@@ -2147,7 +2150,7 @@ async def process_automation_pipeline(client, messages, source_chat_id):
     # 2. FIXED: Reliable Live Entity Fetching & Map Syncing
     is_protected_flow = False
     try:
-        chat_peer = await client.get_entity(source_chat_id)
+        chat_peer = await resolve_target_id(client, source_chat_id)
         # Check initial flag status
         if getattr(chat_peer, 'noforwards', False):
             # Force structural updates over the network wire to purge stale attributes
@@ -3093,7 +3096,7 @@ def cmd_add_manager(message):
                 bot.edit_message_text(f"❌ Userbot error: {msg}", message.chat.id, status_msg.message_id)
                 return
             
-            user_entity = await userbot.get_entity(target_user)
+            user_entity = await resolve_target_id(userbot, target_user)
             uid = user_entity.id
             uname = getattr(user_entity, 'username', None) or ""
             
@@ -3156,7 +3159,7 @@ def cmd_del_manager(message):
                 if not is_ok:
                     bot.edit_message_text(f"❌ Userbot error: {msg}", message.chat.id, status_msg.message_id)
                     return
-                user_entity = await userbot.get_entity(target_user)
+                user_entity = await resolve_target_id(userbot, target_user)
                 uid = user_entity.id
             
             with db_conn() as conn:
@@ -3336,7 +3339,7 @@ async def join_chat_task(call, link_type, value):
         else:
             from telethon.tl.functions.channels import JoinChannelRequest
             try:
-                chat_entity = await userbot.get_entity(value)
+                chat_entity = await resolve_target_id(userbot, value)
                 await userbot(JoinChannelRequest(chat_entity))
             except Exception as e:
                 bot.edit_message_text(f"❌ *Failed to join username:*\n`{e}`", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
@@ -3574,7 +3577,7 @@ def handle_callbacks(call):
         
         async def init_source_flow():
             try:
-                full_chat = await userbot.get_entity(sid)
+                full_chat = await resolve_target_id(userbot, sid)
                 is_forum = getattr(full_chat, "forum", False)
                 if is_forum:
                     markup = await get_topic_selection_markup(sid, "join_src_topic")
@@ -3873,7 +3876,7 @@ def handle_callbacks(call):
             sid = int(parts[2])
             async def handle_src():
                 try:
-                    full_chat = await userbot.get_entity(sid)
+                    full_chat = await resolve_target_id(userbot, sid)
                     is_forum = getattr(full_chat, "forum", False)
                     
                     if is_forum:
@@ -3924,7 +3927,7 @@ def handle_callbacks(call):
             tid = int(parts[2])
             async def handle_tgt():
                 try:
-                    full_chat = await userbot.get_entity(tid)
+                    full_chat = await resolve_target_id(userbot, tid)
                     is_forum = getattr(full_chat, "forum", False)
                     
                     if is_forum:
@@ -4351,7 +4354,7 @@ def handle_callbacks(call):
         async def run_view():
             if not userbot: return
             try:
-                chat = await userbot.get_entity(chat_id)
+                chat = await resolve_target_id(userbot, chat_id)
                 # For message count, we can use a trick with limit=0
                 history = await userbot.get_messages(chat, limit=0)
                 msg_count = history.total
@@ -4891,32 +4894,83 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
         running_tasks.pop(task_key, None)
 
 async def resolve_target_id(client: TelegramClient, target_ref):
+    from telethon.tl.types import PeerChannel, PeerChat, PeerUser
+    
     # Try resolving target_ref directly
     try:
         return await client.get_entity(target_ref)
     except Exception as e:
         logger.warning(f"Initial get_entity failed for {target_ref}: {e}")
-        
-    # If target_ref is numeric, try with -100 prefix or other variations
+
     ref_str = str(target_ref).strip()
-    if ref_str.replace("-", "").isdigit():
-        # Try numeric prefixes
-        clean_id = ref_str.replace("-100", "").replace("-", "")
-        for candidate in [int(f"-100{clean_id}"), -int(clean_id), int(clean_id)]:
+    
+    # Check if target_ref is a username or invite link
+    if not ref_str.replace("-", "").isdigit():
+        # If it's a link, parse it
+        parsed = parse_telegram_link(ref_str)
+        if parsed:
+            if parsed["type"] == "username":
+                try:
+                    return await client.get_entity(parsed["username"])
+                except Exception:
+                    pass
+        else:
+            # Try as username directly
+            try:
+                return await client.get_entity(ref_str)
+            except Exception:
+                pass
+
+    # If it is numeric (or looks like an ID)
+    clean_id = ref_str.replace("-100", "").replace("-", "")
+    if clean_id.isdigit():
+        clean_id_int = int(clean_id)
+        
+        # Candidates to try:
+        # 1. PeerChannel(clean_id_int) -> standard channel
+        # 2. PeerChat(clean_id_int) -> standard chat
+        # 3. PeerUser(clean_id_int) -> standard user
+        # 4. int(f"-100{clean_id}")
+        # 5. -clean_id_int
+        # 6. clean_id_int
+        candidates = [
+            PeerChannel(clean_id_int),
+            PeerChat(clean_id_int),
+            PeerUser(clean_id_int),
+            int(f"-100{clean_id}"),
+            -clean_id_int,
+            clean_id_int
+        ]
+        
+        # First attempt: check if we can resolve any candidate from existing cache
+        for candidate in candidates:
             try:
                 return await client.get_entity(candidate)
             except Exception:
                 pass
-
-    # Try finding via dialogs
-    try:
-        clean_ref = ref_str.replace("-100", "").replace("-", "")
-        async for dialog in client.iter_dialogs(limit=200):
-            d_id_str = str(dialog.id).replace("-100", "").replace("-", "")
-            if d_id_str == clean_ref:
-                return dialog.entity
-    except Exception as e:
-        logger.error(f"iter_dialogs failed during resolution: {e}")
+                
+        # Second attempt: fetch dialogs from network to refresh entity cache
+        try:
+            logger.info("Target entity not found in cache. Refreshing dialogs from Telegram network...")
+            await client.get_dialogs()
+            
+            # Retry candidates after refreshing cache
+            for candidate in candidates:
+                try:
+                    return await client.get_entity(candidate)
+                except Exception:
+                    pass
+        except Exception as ex:
+            logger.error(f"Failed to refresh dialogs: {ex}")
+            
+        # Third attempt: search dialogs list manually
+        try:
+            async for dialog in client.iter_dialogs(limit=200):
+                d_id_str = str(dialog.id).replace("-100", "").replace("-", "")
+                if d_id_str == clean_id:
+                    return dialog.entity
+        except Exception as ex:
+            logger.error(f"iter_dialogs failed during resolution: {ex}")
 
     raise ValueError(f"Could not find or access chat: {target_ref}")
 
@@ -6061,7 +6115,7 @@ class LogBotManager:
                     
                     async def handle_dest():
                         try:
-                            entity = await userbot.get_entity(tid)
+                            entity = await resolve_target_id(userbot, tid)
                             if getattr(entity, 'forum', False):
                                 markup = await get_topic_selection_markup(tid, "lb_vault_topic")
                                 bot_instance.edit_message_text(f"🧵 *Forum Detected*\nSelect a topic in `{entity.title}`:", call.message.chat.id, call.message.message_id, reply_markup=markup)
