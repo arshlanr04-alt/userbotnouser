@@ -1780,6 +1780,7 @@ async def _start_userbot_unlocked():
         # Dissociate connection catchup loops entirely
         userbot.catch_up = False
         await userbot.connect()
+        userbot.catch_up = False
         # Cache user identity for synchronous access in UI
         userbot._me = await userbot.get_me()
         # Register automation handlers
