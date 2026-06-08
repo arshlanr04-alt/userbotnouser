@@ -5155,8 +5155,8 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     pass
             await asyncio.sleep(1.0)
 
-        if not running_tasks.get(task_key):
-            bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user.")
+        if not running_tasks.get(task_key) and not collected_messages:
+            bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user. No messages fetched.")
             return
 
         collected_messages.reverse()
@@ -5198,12 +5198,10 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         total_collected = len(collected_messages)
 
         for batch in grouped_batches:
-            if not running_tasks.get(task_key):
-                break
-
+            is_task_active = running_tasks.get(task_key)
             opts = collection_options.setdefault(task_key, {})
-            opts["status"] = "Forwarding"
-            curr_instant = opts.get("instant_release", False)
+            opts["status"] = "Forwarding" if is_task_active else "Saving"
+            curr_instant = opts.get("instant_release", False) and is_task_active
             instant_filter = opts.get("instant_filter", "everything")
 
             matching_batch = []
@@ -5395,7 +5393,8 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
             except Exception:
                 pass
                 
-            await asyncio.sleep(0.5) # Flood wait safety buffer
+            if is_task_active:
+                await asyncio.sleep(0.5) # Flood wait safety buffer
 
         if running_tasks.get(task_key):
             opts = collection_options.setdefault(task_key, {})
@@ -5418,6 +5417,20 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
             f_label = f" matching {f_map.get(instant_filter, 'All Content')} 🔄" if curr_instant else ""
             sent_label = f"Sent to Target: `{sent_count}`{f_label}" if curr_instant else f"Sent to Target: `{sent_count} (Hold Mode)`"
             bot.send_message(admin_chat_id, f"✅ Collection Done: `{s_title}`\nScanned: `{scanned}`\nCollected & Saved: `{collected}`\n{sent_label}")
+        else:
+            opts = collection_options.setdefault(task_key, {})
+            opts["status"] = "Stopped"
+            try:
+                bot.edit_message_text(
+                    get_collection_status_text(task_key, is_done=True),
+                    admin_chat_id,
+                    status_msg.message_id,
+                    reply_markup=get_collection_markup(pair_id),
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+            bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user.\nScanned: `{scanned}`\nCollected & Saved (Pending release): `{collected}`")
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
     finally:
