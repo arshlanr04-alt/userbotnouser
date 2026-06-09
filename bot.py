@@ -2333,7 +2333,7 @@ async def process_automation_pipeline(client, messages, source_chat_id):
             # Execution Step B: Live Mirror/Forward Engine Routine
             if is_live:
                 is_reply = any(getattr(msg, 'reply_to_msg_id', None) for msg in valid_messages)
-                if is_protected_flow:
+                if is_protected_flow or is_reply:
                     has_media = any(m.media for m in valid_messages)
                     if is_protected_flow and has_media and not any(m.id in media_to_file for m in valid_messages):
                         logger.warning(f"🛡️ PIPELINE: Skipping live mirror for target {tid} (Download Failed).")
@@ -5289,7 +5289,8 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                         if curr_instant and matching_batch:
                             try:
                                 has_media = any(msg.media for msg in matching_batch)
-                                if is_protected_flow:
+                                is_reply = any(getattr(msg, 'reply_to_msg_id', None) for msg in matching_batch)
+                                if is_protected_flow or is_reply:
                                     if has_media and not any(msg.id in media_to_file for msg in matching_batch):
                                         logger.warning("🛡️ COLLECTION: Skipping mirror because media download failed/skipped.")
                                         opts["skipped"] += len(matching_batch)
