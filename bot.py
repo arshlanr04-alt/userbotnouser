@@ -2074,6 +2074,11 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
             
         file_to_send = files_to_send if len(files_to_send) > 1 else (files_to_send[0] if files_to_send else None)
         
+        # Prevent 'The message cannot be empty unless a file is provided' exception
+        if not album_text.strip() and not file_to_send:
+            logger.warning(f"⚠️ MIRROR: Skipping message {first_msg.id} because it has no text content and no media/file.")
+            return
+
         for attempt in range(3):
             try:
                 sent = await client.send_message(
@@ -2955,7 +2960,10 @@ def setup_automation_handlers(client: TelegramClient):
         if m.text and not m.text.strip().startswith('.'):
             if event.is_private:
                 is_admin_or_mgr = (m.sender_id == ADMIN_ID) or (me and m.sender_id == me.id) or is_authorized_manager(m.sender_id)
-                if is_admin_or_mgr:
+                # Verify the chat itself is with the ADMIN, a manager, or self
+                chat_partner_id = event.chat_id
+                is_authorized_chat = (chat_partner_id == ADMIN_ID) or (me and chat_partner_id == me.id) or is_authorized_manager(chat_partner_id)
+                if is_admin_or_mgr and is_authorized_chat:
                     parsed_ref = parse_telegram_link(m.text.strip())
                     if parsed_ref:
                         await event.reply(
