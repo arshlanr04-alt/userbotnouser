@@ -5251,40 +5251,43 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                 async with userbot_lock:
                                     src_peer = await userbot.get_input_entity(int(sid))
                                     tgt_peer = await userbot.get_input_entity(int(tid))
-                                    dest_topic_id = t_topic
-                                    if auto_mirror:
-                                        first_msg = matching_batch[0]
-                                        s_top = None
-                                        if first_msg.reply_to:
-                                            s_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
-                                        if s_top:
-                                            mapped_topic = get_topic_mapping(sid, s_top, tid)
-                                            if mapped_topic:
-                                                dest_topic_id = mapped_topic
-                                            else:
-                                                forum = getattr(first_msg.reply_to, "forum_topic", None)
-                                                src_title = getattr(forum, "title", None)
-                                                src_icon = getattr(forum, "icon_emoji_id", None)
-                                                if not src_title:
-                                                    try:
+                                
+                                dest_topic_id = t_topic
+                                if auto_mirror:
+                                    first_msg = matching_batch[0]
+                                    s_top = None
+                                    if first_msg.reply_to:
+                                        s_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
+                                    if s_top:
+                                        mapped_topic = get_topic_mapping(sid, s_top, tid)
+                                        if mapped_topic:
+                                            dest_topic_id = mapped_topic
+                                        else:
+                                            forum = getattr(first_msg.reply_to, "forum_topic", None)
+                                            src_title = getattr(forum, "title", None)
+                                            src_icon = getattr(forum, "icon_emoji_id", None)
+                                            if not src_title:
+                                                try:
+                                                    async with userbot_lock:
                                                         res = await userbot(functions.messages.GetForumTopicsRequest(
                                                             peer=src_peer, offset_date=0, offset_id=0, offset_topic=0, limit=100
                                                         ))
-                                                        for t in res.topics:
-                                                            if t.id == s_top:
-                                                                src_title = t.title
-                                                                src_icon = getattr(t, "icon_emoji_id", None)
-                                                                break
-                                                    except Exception: pass
-                                                if src_title:
-                                                    dest_topic_id = await get_or_create_target_topic(userbot, tid, src_title, sid, s_top, icon_emoji_id=src_icon)
+                                                    for t in res.topics:
+                                                        if t.id == s_top:
+                                                            src_title = t.title
+                                                            src_icon = getattr(t, "icon_emoji_id", None)
+                                                            break
+                                                except Exception: pass
+                                            if src_title:
+                                                dest_topic_id = await get_or_create_target_topic(userbot, tid, src_title, sid, s_top, icon_emoji_id=src_icon)
 
-                                    import random
-                                    random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in matching_batch]
-                                    target_entity = await resolve_target_id(userbot, tid)
-                                    is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
-                                    top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
-                                    
+                                import random
+                                random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in matching_batch]
+                                target_entity = await resolve_target_id(userbot, tid)
+                                is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
+                                top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
+                                
+                                async with userbot_lock:
                                     fwd_res = await userbot(functions.messages.ForwardMessagesRequest(
                                         from_peer=src_peer,
                                         id=[msg.id for msg in matching_batch],
@@ -5479,9 +5482,8 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
     
         try:
             # Pre-resolve entities to warm up Telethon cache and ensure access
-            async with userbot_lock:
-                source_chat = await resolve_target_id(userbot, sid_ref)
-                target_chat = await resolve_target_id(userbot, tid_ref)
+            source_chat = await resolve_target_id(userbot, sid_ref)
+            target_chat = await resolve_target_id(userbot, tid_ref)
         except Exception as e:
             bot.send_message(admin_chat_id, f"❌ Connection Error: {e}\n\nMake sure the bot is a member of both chats.")
             return
@@ -5524,9 +5526,9 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
             
             advance = True
             try:
-                async with userbot_lock:
-                    msg = await userbot.get_messages(source_chat, ids=smid)
+                msg = await userbot.get_messages(source_chat, ids=smid)
                 if not msg:
+                    # Message is deleted/empty, mark it as inaccessible/skipped so we don't loop on it
                     with db_conn() as conn:
                         c = conn.cursor()
                         p = get_placeholder()
@@ -5534,8 +5536,17 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                         conn.commit()
                     continue
 
+                # --- CONTENT FILTERING ---
                 cf = cf or "everything"
-                if (cf == "media" and not msg.media) or (cf == "text" and msg.media):
+                if cf == "media" and not msg.media:
+                    # Mark as released so we don't try again
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                        conn.commit()
+                    continue
+                if cf == "text" and msg.media:
                     with db_conn() as conn:
                         c = conn.cursor()
                         p = get_placeholder()
@@ -5543,86 +5554,140 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                         conn.commit()
                     continue
 
-                if (release_filter == "media" and not msg.media) or (release_filter == "text" and msg.media):
-                    idx += 1
+                # --- DYNAMIC RELEASE FILTERING ---
+                # Check message against dynamic release filter: if it doesn't match, we skip
+                # sending but keep it in the database as unreleased (released = 0) for future release runs.
+                if release_filter == "media" and not msg.media:
+                    continue
+                if release_filter == "text" and msg.media:
                     continue
 
                 target_topic_anchor = t_topic
+                
+                # Determine if BOTH chats are forums to automatically mirror topics
                 auto_mirror = False
                 if getattr(source_chat, 'forum', False) and getattr(target_chat, 'forum', False):
                     auto_mirror = True
 
+                # Handle Mirroring ID detection for release
                 if auto_mirror:
                     s_top = None
                     if msg.reply_to:
                         s_top = getattr(msg.reply_to, 'reply_to_top_id', None) or msg.reply_to.reply_to_msg_id
+                    
                     if s_top:
+                        # Priority check database mapping
                         mapped = get_topic_mapping(sid_ref, s_top, tid_ref)
                         if mapped:
                             target_topic_anchor = mapped
 
+                # Resolve reply mapping
                 reply_to_val = None
                 if getattr(msg, "reply_to_msg_id", None):
                     reply_to_val = get_message_mapping(sid_ref, msg.reply_to_msg_id, tid_ref)
 
+                # Construct Topic Header
+                # If it's a specific reply, use it. Otherwise, use the Topic Header ID.
                 final_reply_target = reply_to_val if reply_to_val else target_topic_anchor
 
                 sent_msg = None
                 try:
-                    async with userbot_lock:
-                        sent_msg = await userbot.send_message(
-                            entity=target_chat,
-                            message=msg.message or "",
-                            file=msg.media,
-                            reply_to=int(final_reply_target) if final_reply_target else None
-                        )
+                    sent_msg = await userbot.send_message(
+                        entity=target_chat,
+                        message=msg.message or "",
+                        file=msg.media,
+                        reply_to=int(final_reply_target) if final_reply_target else None
+                    )
                 except Exception as e:
+                    # If we had a reply target, attempt to fallback/downgrade reply first
                     if final_reply_target is not None:
                         is_forum = getattr(target_chat, 'forum', False) if not isinstance(target_chat, int) else False
-                        next_reply = int(target_topic_anchor) if (is_forum and target_topic_anchor and int(final_reply_target) != int(target_topic_anchor)) else None
+                        next_reply = None
+                        if is_forum and target_topic_anchor and int(final_reply_target) != int(target_topic_anchor):
+                            next_reply = int(target_topic_anchor)
+                        
                         logger.warning(f"⚠️ RELEASE: Failed to send with reply_to={final_reply_target} ({e}). Retrying with reply_to={next_reply}...")
                         try:
-                            async with userbot_lock:
-                                sent_msg = await userbot.send_message(entity=target_chat, message=msg.message or "", file=msg.media, reply_to=next_reply)
+                            sent_msg = await userbot.send_message(
+                                entity=target_chat,
+                                message=msg.message or "",
+                                file=msg.media,
+                                reply_to=next_reply
+                            )
                         except Exception as e2:
                             if next_reply is not None:
                                 logger.warning(f"⚠️ RELEASE: Failed to send with reply_to={next_reply} ({e2}). Retrying with reply_to=None...")
                                 try:
-                                    async with userbot_lock:
-                                        sent_msg = await userbot.send_message(entity=target_chat, message=msg.message or "", file=msg.media, reply_to=None)
-                                except Exception as e3: e = e3
-                            else: e = e2
+                                    sent_msg = await userbot.send_message(
+                                        entity=target_chat,
+                                        message=msg.message or "",
+                                        file=msg.media,
+                                        reply_to=None
+                                    )
+                                except Exception as e3:
+                                    e = e3
+                            else:
+                                e = e2
                     
+                    # If still failed, check if we need to do fallback download & upload
                     if not sent_msg:
                         err_msg = str(e).lower()
                         if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer"]):
+                            logger.info("🛡️ RELEASE: Protected or invalid peer media detected. Attempting download & upload fallback...")
                             local_file = None
                             try:
-                                async with userbot_lock: local_file = await userbot.download_media(msg)
-                            except Exception as de: logger.error(f"Failed to download media in release fallback: {de}")
+                                local_file = await userbot.download_media(msg)
+                            except errors.FloodWaitError as fwe:
+                                raise fwe
+                            except Exception as de:
+                                logger.error(f"Failed to download media in release fallback: {de}")
                             if local_file:
                                 try:
-                                    async with userbot_lock:
-                                        sent_msg = await userbot.send_message(entity=target_chat, message=msg.message or "", file=local_file, reply_to=int(final_reply_target) if final_reply_target else None)
+                                    sent_msg = await userbot.send_message(
+                                        entity=target_chat,
+                                        message=msg.message or "",
+                                        file=local_file,
+                                        reply_to=int(final_reply_target) if final_reply_target else None
+                                    )
                                 except Exception as fe:
+                                    # Downgrade in fallback as well
                                     if final_reply_target is not None:
                                         is_forum = getattr(target_chat, 'forum', False) if not isinstance(target_chat, int) else False
-                                        next_reply = int(target_topic_anchor) if (is_forum and target_topic_anchor and int(final_reply_target) != int(target_topic_anchor)) else None
+                                        next_reply = None
+                                        if is_forum and target_topic_anchor and int(final_reply_target) != int(target_topic_anchor):
+                                            next_reply = int(target_topic_anchor)
+                                        
+                                        logger.warning(f"⚠️ RELEASE FALLBACK: Failed to send with reply_to={final_reply_target} ({fe}). Retrying with reply_to={next_reply}...")
                                         try:
-                                            async with userbot_lock:
-                                                sent_msg = await userbot.send_message(entity=target_chat, message=msg.message or "", file=local_file, reply_to=next_reply)
+                                            sent_msg = await userbot.send_message(
+                                                entity=target_chat,
+                                                message=msg.message or "",
+                                                file=local_file,
+                                                reply_to=next_reply
+                                            )
                                         except Exception as fe2:
                                             if next_reply is not None:
+                                                logger.warning(f"⚠️ RELEASE FALLBACK: Failed to send with reply_to={next_reply} ({fe2}). Retrying with reply_to=None...")
                                                 try:
-                                                    async with userbot_lock:
-                                                        sent_msg = await userbot.send_message(entity=target_chat, message=msg.message or "", file=local_file, reply_to=None)
-                                                except Exception as fe3: raise fe3
-                                            else: raise fe2
-                                    else: raise fe
+                                                    sent_msg = await userbot.send_message(
+                                                        entity=target_chat,
+                                                        message=msg.message or "",
+                                                        file=local_file,
+                                                        reply_to=None
+                                                    )
+                                                except Exception as fe3:
+                                                    raise fe3
+                                            else:
+                                                raise fe2
+                                    else:
+                                        raise fe
                                 finally:
-                                    if os.path.exists(local_file): os.remove(local_file)
-                            else: raise e
-                        else: raise e
+                                    if os.path.exists(local_file):
+                                        os.remove(local_file)
+                            else:
+                                raise e
+                        else:
+                            raise e
                 
                 if sent_msg:
                     save_message_mapping(sid_ref, msg.id, tid_ref, sent_msg.id)
@@ -5639,8 +5704,14 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
             except errors.FloodWaitError as fwe:
                 logger.warning(f"⏳ RELEASE FLOOD: A wait of {fwe.seconds} seconds is required. Sleeping...")
                 try:
-                    bot.edit_message_text(f"⏳ *Release Rate-Limited*\n\nWaiting `{fwe.seconds}` seconds before retrying message ID `{smid}`...", admin_chat_id, status_msg.message_id, reply_markup=markup)
-                except Exception: pass
+                    bot.edit_message_text(
+                        f"⏳ *Release Rate-Limited*\n\nWaiting `{fwe.seconds}` seconds before retrying message ID `{smid}`...",
+                        admin_chat_id,
+                        status_msg.message_id,
+                        reply_markup=markup
+                    )
+                except Exception:
+                    pass
                 await asyncio.sleep(fwe.seconds)
                 advance = False
             except Exception as e:
