@@ -5045,8 +5045,6 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
             except Exception:
                 pass
         
-        collected_messages = []
-        
         total_count = 0
         try:
             async with userbot_lock:
@@ -5066,6 +5064,20 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         chunk_size = 100
         to_fetch_remain = limit if limit else total_count
         
+        auto_mirror = is_mir
+        is_protected_flow = getattr(source_chat, 'noforwards', False)
+        if is_protected_flow:
+            try:
+                from telethon.tl.functions.channels import GetChannelsRequest
+                async with userbot_lock:
+                    res = await userbot(GetChannelsRequest(id=[source_chat]))
+                if res and res.chats:
+                    source_chat = res.chats[0]
+                    is_protected_flow = getattr(source_chat, 'noforwards', False)
+                    update_telethon_entity_cache(userbot, source_chat)
+            except Exception:
+                pass
+
         while to_fetch_remain is None or to_fetch_remain > 0:
             if not running_tasks.get(task_key):
                 break
@@ -5086,6 +5098,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
             if not chunk:
                 break
                 
+            chunk_valid = []
             for m in chunk:
                 scanned += 1
                 progress = int((scanned / total_to_fetch) * 100)
@@ -5128,7 +5141,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     opts.update({"scanned": scanned, "progress": progress})
                     continue
                     
-                collected_messages.append(m)
+                chunk_valid.append(m)
                 collected += 1
                 
                 opts.update({
@@ -5136,287 +5149,244 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     "collected": collected,
                     "progress": progress
                 })
-            
+
+            if chunk_valid:
+                # Group chunk messages by grouped_id
+                chunk_batches = []
+                temp_group = []
+                for m in chunk_valid:
+                    if m.grouped_id:
+                        if not temp_group:
+                            temp_group.append(m)
+                        elif temp_group[0].grouped_id == m.grouped_id:
+                            temp_group.append(m)
+                        else:
+                            chunk_batches.append(temp_group)
+                            temp_group = [m]
+                    else:
+                        if temp_group:
+                            chunk_batches.append(temp_group)
+                            temp_group = []
+                        chunk_batches.append([m])
+                if temp_group:
+                    chunk_batches.append(temp_group)
+
+                for batch in chunk_batches:
+                    is_task_active = running_tasks.get(task_key)
+                    curr_instant = opts.get("instant_release", False) and is_task_active
+                    instant_filter = opts.get("instant_filter", "everything")
+
+                    matching_batch = []
+                    for msg in batch:
+                        matches = True
+                        if instant_filter == "media" and not msg.media:
+                            matches = False
+                        elif instant_filter == "text" and msg.media:
+                            matches = False
+                        if matches:
+                            matching_batch.append(msg)
+
+                    media_to_file = {}
+                    if curr_instant and is_protected_flow and matching_batch:
+                        for msg in matching_batch:
+                            if msg.media:
+                                try:
+                                    async with userbot_lock:
+                                        path = await userbot.download_media(msg)
+                                    if path:
+                                        media_to_file[msg.id] = path
+                                except errors.FloodWaitError as fwe:
+                                    logger.warning(f"⏳ COLLECTION FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
+                                    if fwe.seconds <= 5:
+                                        await asyncio.sleep(fwe.seconds)
+                                        try:
+                                            async with userbot_lock:
+                                                path = await userbot.download_media(msg)
+                                            if path: media_to_file[msg.id] = path
+                                        except Exception as e2:
+                                            logger.error(f"Failed to download media after short flood wait: {e2}")
+                                except Exception as e:
+                                    logger.error(f"Failed to download media for message {msg.id}: {e}")
+
+                    try:
+                        if curr_instant and matching_batch:
+                            try:
+                                has_media = any(msg.media for msg in matching_batch)
+                                if is_protected_flow:
+                                    if has_media and not any(msg.id in media_to_file for msg in matching_batch):
+                                        logger.warning("🛡️ COLLECTION: Skipping mirror because media download failed/skipped.")
+                                        opts["skipped"] += len(matching_batch)
+                                    else:
+                                        async with userbot_lock:
+                                            await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None)
+                                        sent_count += len(matching_batch)
+                                else:
+                                    try:
+                                        async with userbot_lock:
+                                            src_peer = await userbot.get_input_entity(int(sid))
+                                            tgt_peer = await userbot.get_input_entity(int(tid))
+                                        
+                                        dest_topic_id = t_topic
+                                        if auto_mirror:
+                                            first_msg = matching_batch[0]
+                                            s_top = None
+                                            if first_msg.reply_to:
+                                                s_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
+                                            if s_top:
+                                                mapped_topic = get_topic_mapping(sid, s_top, tid)
+                                                if mapped_topic:
+                                                    dest_topic_id = mapped_topic
+                                                else:
+                                                    forum = getattr(first_msg.reply_to, "forum_topic", None)
+                                                    src_title = getattr(forum, "title", None)
+                                                    src_icon = getattr(forum, "icon_emoji_id", None)
+                                                    if not src_title:
+                                                        try:
+                                                            async with userbot_lock:
+                                                                res = await userbot(functions.messages.GetForumTopicsRequest(
+                                                                    peer=src_peer, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                                                ))
+                                                            for t in res.topics:
+                                                                if t.id == s_top:
+                                                                    src_title = t.title
+                                                                    src_icon = getattr(t, "icon_emoji_id", None)
+                                                                    break
+                                                        except Exception: pass
+                                                    if src_title:
+                                                        dest_topic_id = await get_or_create_target_topic(userbot, tid, src_title, sid, s_top, icon_emoji_id=src_icon)
+
+                                        import random
+                                        random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in matching_batch]
+                                        target_entity = await resolve_target_id(userbot, tid)
+                                        is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
+                                        top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
+                                        
+                                        async with userbot_lock:
+                                            fwd_res = await userbot(functions.messages.ForwardMessagesRequest(
+                                                from_peer=src_peer,
+                                                id=[msg.id for msg in matching_batch],
+                                                to_peer=target_entity,
+                                                random_id=random_ids,
+                                                top_msg_id=top_msg_id_val
+                                            ))
+                                        if fwd_res:
+                                            fwd_msgs = []
+                                            if hasattr(fwd_res, 'updates'):
+                                                for u in fwd_res.updates:
+                                                    if type(u).__name__ in ["UpdateNewMessage", "UpdateNewChannelMessage"]:
+                                                        fwd_msgs.append(u.message)
+                                            if len(fwd_msgs) == len(matching_batch):
+                                                for orig_m, fwd_m in zip(matching_batch, fwd_msgs):
+                                                    save_message_mapping(sid, orig_m.id, tid, fwd_m.id)
+                                        sent_count += len(matching_batch)
+                                    except Exception as fwd_err:
+                                        logger.error(f"Native Forward in collection failed ({fwd_err}). Falling back to mirror...")
+                                        async with userbot_lock:
+                                            await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid)
+                                        sent_count += len(matching_batch)
+                            except Exception as fe:
+                                logger.error(f"Failed to forward batch: {fe}")
+                                opts["skipped"] += len(matching_batch)
+                        
+                        # Save to database
+                        with db_conn() as conn:
+                            c = conn.cursor()
+                            for m in batch:
+                                m_type = get_specific_media_type(m.media)
+                                if curr_instant:
+                                    matches = True
+                                    if instant_filter == "media" and not m.media:
+                                        matches = False
+                                    elif instant_filter == "text" and m.media:
+                                        matches = False
+                                    rel_val = 1 if matches else 0
+                                else:
+                                    rel_val = 0
+
+                                if USING_POSTGRES:
+                                    c.execute(
+                                        """
+                                        INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) 
+                                        VALUES (%s, %s, %s, %s, %s, 'collection', %s) 
+                                        ON CONFLICT (source_chat_id, source_message_id) 
+                                        DO UPDATE SET 
+                                            pair_id = EXCLUDED.pair_id,
+                                            media_type = EXCLUDED.media_type,
+                                            caption = EXCLUDED.caption,
+                                            added_by = EXCLUDED.added_by,
+                                            released = EXCLUDED.released,
+                                            timestamp = CURRENT_TIMESTAMP
+                                        """,
+                                        (pair_id, sid, m.id, m_type, m.message or "", rel_val)
+                                    )
+                                else:
+                                    c.execute(
+                                        """
+                                        INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) 
+                                        VALUES (?, ?, ?, ?, ?, 'collection', ?) 
+                                        ON CONFLICT (source_chat_id, source_message_id) 
+                                        DO UPDATE SET 
+                                            pair_id = excluded.pair_id,
+                                            media_type = excluded.media_type,
+                                            caption = excluded.caption,
+                                            added_by = excluded.added_by,
+                                            released = excluded.released,
+                                            timestamp = datetime('now')
+                                        """,
+                                        (pair_id, sid, m.id, m_type, m.message or "", rel_val)
+                                    )
+                            conn.commit()
+
+                        # Send to log bots
+                        if curr_instant and matching_batch:
+                            has_media = any(msg.media for msg in matching_batch)
+                            if is_protected_flow:
+                                files_to_vault = [media_to_file.get(m.id) for m in matching_batch if m.id in media_to_file]
+                                if files_to_vault:
+                                    file_payload = files_to_vault if len(files_to_vault) > 1 else files_to_vault[0]
+                                    for token, username, bot_id in get_log_bots():
+                                        metadata = f"SID: {sid} | MID: {matching_batch[0].id}\n"
+                                        caption_text = metadata + (matching_batch[0].message or "")
+                                        try:
+                                            vaulted_result = await userbot.send_message(
+                                                entity=int(bot_id),
+                                                file=file_payload,
+                                                message=caption_text
+                                            )
+                                            if vaulted_result:
+                                                v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
+                                                for i, v_m in enumerate(v_msgs):
+                                                    orig_m = matching_batch[i]
+                                                    save_logged_media(
+                                                        bot_id=int(bot_id),
+                                                        log_msg_id=int(v_m.id),
+                                                        source_chat_id=int(sid),
+                                                        source_msg_id=int(orig_m.id),
+                                                        file_id=None,
+                                                        media_type=type(orig_m.media).__name__ if orig_m.media else "text",
+                                                        caption=orig_m.message or "",
+                                                        grouped_id=orig_m.grouped_id
+                                                    )
+                                        except Exception as e:
+                                            logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
+                            else:
+                                asyncio.create_task(forward_to_log_bots(userbot, matching_batch, sid))
+                    finally:
+                        for temp_path in media_to_file.values():
+                            if os.path.exists(temp_path):
+                                try: os.remove(temp_path)
+                                except Exception: pass
+                                
+                        opts.update({
+                            "sent_count": sent_count
+                        })
+
             if to_fetch_remain is not None:
                 to_fetch_remain -= len(chunk)
                 
             offset_id = chunk[-1].id
             
-            if scanned % 50 == 0 or scanned == total_to_fetch:
-                try:
-                    bot.edit_message_text(
-                        get_collection_status_text(task_key),
-                        admin_chat_id,
-                        status_msg.message_id,
-                        reply_markup=get_collection_markup(pair_id),
-                        parse_mode="HTML"
-                    )
-                except Exception:
-                    pass
-            await asyncio.sleep(1.0)
-
-        if not running_tasks.get(task_key) and not collected_messages:
-            bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user. No messages fetched.")
-            return
-        
-        grouped_batches = []
-        temp_group = []
-        for m in collected_messages:
-            if m.grouped_id:
-                if not temp_group:
-                    temp_group.append(m)
-                elif temp_group[0].grouped_id == m.grouped_id:
-                    temp_group.append(m)
-                else:
-                    grouped_batches.append(temp_group)
-                    temp_group = [m]
-            else:
-                if temp_group:
-                    grouped_batches.append(temp_group)
-                    temp_group = []
-                grouped_batches.append([m])
-        if temp_group:
-            grouped_batches.append(temp_group)
-
-        auto_mirror = is_mir
-        is_protected_flow = getattr(source_chat, 'noforwards', False)
-        if is_protected_flow:
-            try:
-                from telethon.tl.functions.channels import GetChannelsRequest
-                async with userbot_lock:
-                    res = await userbot(GetChannelsRequest(id=[source_chat]))
-                if res and res.chats:
-                    source_chat = res.chats[0]
-                    is_protected_flow = getattr(source_chat, 'noforwards', False)
-                    update_telethon_entity_cache(userbot, source_chat)
-            except Exception:
-                pass
-
-        processed_count = 0
-        total_collected = len(collected_messages)
-
-        for batch in grouped_batches:
             is_task_active = running_tasks.get(task_key)
-            opts = collection_options.setdefault(task_key, {})
-            opts["status"] = "Forwarding" if is_task_active else "Saving"
-            curr_instant = opts.get("instant_release", False) and is_task_active
-            instant_filter = opts.get("instant_filter", "everything")
-
-            matching_batch = []
-            for msg in batch:
-                matches = True
-                if instant_filter == "media" and not msg.media:
-                    matches = False
-                elif instant_filter == "text" and msg.media:
-                    matches = False
-                if matches:
-                    matching_batch.append(msg)
-
-            media_to_file = {}
-            if curr_instant and is_protected_flow and matching_batch:
-                for msg in matching_batch:
-                    if msg.media:
-                        try:
-                            async with userbot_lock:
-                                path = await userbot.download_media(msg)
-                            if path:
-                                media_to_file[msg.id] = path
-                        except errors.FloodWaitError as fwe:
-                            logger.warning(f"⏳ COLLECTION FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
-                            if fwe.seconds <= 5:
-                                await asyncio.sleep(fwe.seconds)
-                                try:
-                                    async with userbot_lock:
-                                        path = await userbot.download_media(msg)
-                                    if path: media_to_file[msg.id] = path
-                                except Exception as e2:
-                                    logger.error(f"Failed to download media after short flood wait: {e2}")
-                        except Exception as e:
-                            logger.error(f"Failed to download media for message {msg.id}: {e}")
-
-            try:
-                if curr_instant and matching_batch:
-                    try:
-                        has_media = any(msg.media for msg in matching_batch)
-                        if is_protected_flow:
-                            if has_media and not any(msg.id in media_to_file for msg in matching_batch):
-                                logger.warning("🛡️ COLLECTION: Skipping mirror because media download failed/skipped.")
-                                opts["skipped"] += len(matching_batch)
-                            else:
-                                async with userbot_lock:
-                                    await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid, pre_downloaded=media_to_file if (is_protected_flow and has_media) else None)
-                                sent_count += len(matching_batch)
-                        else:
-                            try:
-                                async with userbot_lock:
-                                    src_peer = await userbot.get_input_entity(int(sid))
-                                    tgt_peer = await userbot.get_input_entity(int(tid))
-                                
-                                dest_topic_id = t_topic
-                                if auto_mirror:
-                                    first_msg = matching_batch[0]
-                                    s_top = None
-                                    if first_msg.reply_to:
-                                        s_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
-                                    if s_top:
-                                        mapped_topic = get_topic_mapping(sid, s_top, tid)
-                                        if mapped_topic:
-                                            dest_topic_id = mapped_topic
-                                        else:
-                                            forum = getattr(first_msg.reply_to, "forum_topic", None)
-                                            src_title = getattr(forum, "title", None)
-                                            src_icon = getattr(forum, "icon_emoji_id", None)
-                                            if not src_title:
-                                                try:
-                                                    async with userbot_lock:
-                                                        res = await userbot(functions.messages.GetForumTopicsRequest(
-                                                            peer=src_peer, offset_date=0, offset_id=0, offset_topic=0, limit=100
-                                                        ))
-                                                    for t in res.topics:
-                                                        if t.id == s_top:
-                                                            src_title = t.title
-                                                            src_icon = getattr(t, "icon_emoji_id", None)
-                                                            break
-                                                except Exception: pass
-                                            if src_title:
-                                                dest_topic_id = await get_or_create_target_topic(userbot, tid, src_title, sid, s_top, icon_emoji_id=src_icon)
-
-                                import random
-                                random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in matching_batch]
-                                target_entity = await resolve_target_id(userbot, tid)
-                                is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
-                                top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
-                                
-                                async with userbot_lock:
-                                    fwd_res = await userbot(functions.messages.ForwardMessagesRequest(
-                                        from_peer=src_peer,
-                                        id=[msg.id for msg in matching_batch],
-                                        to_peer=target_entity,
-                                        random_id=random_ids,
-                                        top_msg_id=top_msg_id_val
-                                    ))
-                                if fwd_res:
-                                    fwd_msgs = []
-                                    if hasattr(fwd_res, 'updates'):
-                                        for u in fwd_res.updates:
-                                            if type(u).__name__ in ["UpdateNewMessage", "UpdateNewChannelMessage"]:
-                                                fwd_msgs.append(u.message)
-                                    if len(fwd_msgs) == len(matching_batch):
-                                        for orig_m, fwd_m in zip(matching_batch, fwd_msgs):
-                                            save_message_mapping(sid, orig_m.id, tid, fwd_m.id)
-                                sent_count += len(matching_batch)
-                            except Exception as fwd_err:
-                                logger.error(f"Native Forward in collection failed ({fwd_err}). Falling back to mirror...")
-                                async with userbot_lock:
-                                    await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid)
-                                sent_count += len(matching_batch)
-                    except Exception as fe:
-                        logger.error(f"Failed to forward batch: {fe}")
-                        opts["skipped"] += len(matching_batch)
-                
-                # 2. Save to database
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    for m in batch:
-                        m_type = get_specific_media_type(m.media)
-                        # Determine release status for this specific message
-                        if curr_instant:
-                            matches = True
-                            if instant_filter == "media" and not m.media:
-                                matches = False
-                            elif instant_filter == "text" and m.media:
-                                matches = False
-                            rel_val = 1 if matches else 0
-                        else:
-                            rel_val = 0
-
-                        if USING_POSTGRES:
-                            c.execute(
-                                """
-                                INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) 
-                                VALUES (%s, %s, %s, %s, %s, 'collection', %s) 
-                                ON CONFLICT (source_chat_id, source_message_id) 
-                                DO UPDATE SET 
-                                    pair_id = EXCLUDED.pair_id,
-                                    media_type = EXCLUDED.media_type,
-                                    caption = EXCLUDED.caption,
-                                    added_by = EXCLUDED.added_by,
-                                    released = EXCLUDED.released,
-                                    timestamp = CURRENT_TIMESTAMP
-                                """,
-                                (pair_id, sid, m.id, m_type, m.message or "", rel_val)
-                            )
-                        else:
-                            c.execute(
-                                """
-                                INSERT INTO collected_media (pair_id, source_chat_id, source_message_id, media_type, caption, added_by, released) 
-                                VALUES (?, ?, ?, ?, ?, 'collection', ?) 
-                                ON CONFLICT (source_chat_id, source_message_id) 
-                                DO UPDATE SET 
-                                    pair_id = excluded.pair_id,
-                                    media_type = excluded.media_type,
-                                    caption = excluded.caption,
-                                    added_by = excluded.added_by,
-                                    released = excluded.released,
-                                    timestamp = datetime('now')
-                                """,
-                                (pair_id, sid, m.id, m_type, m.message or "", rel_val)
-                            )
-                    conn.commit()
-                # 3. Send to log bots (through Vault) if instant release is active and matching_batch exists
-                if curr_instant and matching_batch:
-                    has_media = any(msg.media for msg in matching_batch)
-                    if is_protected_flow:
-                        files_to_vault = [media_to_file.get(m.id) for m in matching_batch if m.id in media_to_file]
-                        if files_to_vault:
-                            file_payload = files_to_vault if len(files_to_vault) > 1 else files_to_vault[0]
-                            for token, username, bot_id in get_log_bots():
-                                metadata = f"SID: {sid} | MID: {matching_batch[0].id}\n"
-                                caption_text = metadata + (matching_batch[0].message or "")
-                                try:
-                                    vaulted_result = await userbot.send_message(
-                                        entity=int(bot_id),
-                                        file=file_payload,
-                                        message=caption_text
-                                    )
-                                    if vaulted_result:
-                                        v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
-                                        for i, v_m in enumerate(v_msgs):
-                                            orig_m = matching_batch[i]
-                                            save_logged_media(
-                                                bot_id=int(bot_id),
-                                                log_msg_id=int(v_m.id),
-                                                source_chat_id=int(sid),
-                                                source_msg_id=int(orig_m.id),
-                                                file_id=None,
-                                                media_type=type(orig_m.media).__name__ if orig_m.media else "text",
-                                                caption=orig_m.message or "",
-                                                grouped_id=orig_m.grouped_id
-                                            )
-                                except Exception as e:
-                                    logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
-                    else:
-                        asyncio.create_task(forward_to_log_bots(userbot, matching_batch, sid))
-            finally:
-                for temp_path in media_to_file.values():
-                    if os.path.exists(temp_path):
-                        try: os.remove(temp_path)
-                        except Exception: pass
-                
-            # Update progress options for live callback queries
-            processed_count += len(batch)
-            progress = int((processed_count / total_collected) * 100) if total_collected > 0 else 100
-            if progress > 100: progress = 100
-
-            opts = collection_options.setdefault(task_key, {})
-            opts.update({
-                "progress": progress,
-                "sent_count": sent_count
-            })
-            curr_instant = opts.get("instant_release", False)
-            curr_filter = opts.get("instant_filter", "everything")
-
-            # Edit status message
             if is_task_active:
                 try:
                     bot.edit_message_text(
@@ -5428,9 +5398,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     )
                 except Exception:
                     pass
-                
-            if is_task_active:
-                await asyncio.sleep(0.5) # Flood wait safety buffer
+                await asyncio.sleep(1.0)
 
         if running_tasks.get(task_key):
             opts = collection_options.setdefault(task_key, {})
@@ -5454,7 +5422,8 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
             sent_label = f"Sent to Target: `{sent_count}`{f_label}" if curr_instant else f"Sent to Target: `{sent_count} (Hold Mode)`"
             bot.send_message(admin_chat_id, f"✅ Collection Done: `{s_title}`\nScanned: `{scanned}`\nCollected & Saved: `{collected}`\n{sent_label}")
         else:
-            bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user.\nScanned: `{scanned}`\nCollected & Saved (Pending release): `{collected}`")
+            bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user.\nScanned: `{scanned}`\nCollected & Saved: `{collected}`")
+            
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
     finally:
