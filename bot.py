@@ -5155,11 +5155,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     pass
             await asyncio.sleep(1.0)
 
-        if not running_tasks.get(task_key):
-            try:
-                bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user. Saving already fetched messages to queue...")
-            except Exception:
-                pass
+        task_was_stopped = not running_tasks.get(task_key)
 
         collected_messages.reverse()
         
@@ -5200,12 +5196,18 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         total_collected = len(collected_messages)
 
         for batch in grouped_batches:
-            is_task_active = running_tasks.get(task_key)
+            if not running_tasks.get(task_key):
+                task_was_stopped = True
 
             opts = collection_options.setdefault(task_key, {})
-            opts["status"] = "Forwarding" if is_task_active else "Saving"
-            curr_instant = opts.get("instant_release", False) if is_task_active else False
-            instant_filter = opts.get("instant_filter", "everything")
+            if task_was_stopped:
+                opts["status"] = "Saving"
+                curr_instant = False
+                instant_filter = "everything"
+            else:
+                opts["status"] = "Forwarding"
+                curr_instant = opts.get("instant_release", False)
+                instant_filter = opts.get("instant_filter", "everything")
 
             matching_batch = []
             for msg in batch:
@@ -5364,7 +5366,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                 except Exception as e:
                                     logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
                     else:
-                         asyncio.create_task(forward_to_log_bots(userbot, matching_batch, sid))
+                        asyncio.create_task(forward_to_log_bots(userbot, matching_batch, sid))
             finally:
                 for temp_path in media_to_file.values():
                     if os.path.exists(temp_path):
@@ -5381,7 +5383,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 "progress": progress,
                 "sent_count": sent_count
             })
-            curr_instant = opts.get("instant_release", False) if is_task_active else False
+            curr_instant = opts.get("instant_release", False)
             curr_filter = opts.get("instant_filter", "everything")
 
             # Edit status message
@@ -5396,10 +5398,9 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
             except Exception:
                 pass
                 
-            if is_task_active:
-                await asyncio.sleep(0.5) # Flood wait safety buffer
+            await asyncio.sleep(0.5) # Flood wait safety buffer
 
-        if running_tasks.get(task_key):
+        if not task_was_stopped:
             opts = collection_options.setdefault(task_key, {})
             opts["status"] = "Completed"
             opts["progress"] = 100
@@ -5423,10 +5424,9 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         else:
             opts = collection_options.setdefault(task_key, {})
             opts["status"] = "Stopped"
-            opts["progress"] = 100
             try:
                 bot.edit_message_text(
-                    get_collection_status_text(task_key, is_done=True),
+                    get_collection_status_text(task_key, is_done=False, status_text="Stopped"),
                     admin_chat_id,
                     status_msg.message_id,
                     reply_markup=get_collection_markup(pair_id),
@@ -5434,7 +5434,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 )
             except Exception:
                 pass
-            bot.send_message(admin_chat_id, f"🛑 Collection stopped by user for `{s_title}`.\nScanned: `{scanned}`\nCollected & Saved to Queue: `{collected}`")
+            bot.send_message(admin_chat_id, f"🛑 Collection Stopped by User: `{s_title}`\nScanned: `{scanned}`\nCollected & Saved: `{collected}`")
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
     finally:
