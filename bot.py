@@ -1074,21 +1074,25 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                     msgs_to_forward = [m for m in msgs_to_forward if m]
                     
                     if msgs_to_forward:
-                        # Use the first available caption for the album
-                        main_caption = next((c for c in captions if c), "")
+                        # FIX: Extract and clean raw captions by removing SID/MID patterns dynamically
+                        raw_caption = next((c for c in captions if c), "")
+                        clean_caption = re.sub(r"SID:\s*-?\d+\s*\|\s*MID:\s*\d+\n?", "", raw_caption).strip()
                         
                         try:
-                            # Forward natively to preserve the forward tag and speed up the transfer
+                            # Forward natively if unrestricted and clean of metadata tags to preserve forward tag layout
+                            has_metadata = any(m.message and ("SID:" in m.message or "MID:" in m.message) for m in msgs_to_forward)
+                            if has_metadata:
+                                raise ValueError("Metadata tags present in vault messages; forcing upload fallback to strip tags.")
                             await userbot.forward_messages(
                                 entity=int(target_id),
                                 messages=msgs_to_forward,
                                 reply_to=target_topic_id if target_topic_id else None
                             )
                         except Exception as fwd_err:
-                            logger.warning(f"Failed to forward natively in vault release: {fwd_err}. Falling back to send_message.")
+                            logger.warning(f"Failed to forward natively in vault release: {fwd_err}. Falling back to clean upload.")
                             await userbot.send_message(
                                 entity=int(target_id),
-                                message=main_caption,
+                                message=clean_caption,
                                 file=[m.media for m in msgs_to_forward] if len(msgs_to_forward) > 1 else msgs_to_forward[0].media,
                                 reply_to=target_topic_id if target_topic_id else None 
                             )
@@ -2050,6 +2054,9 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
 
         # 4. Send Content
         album_text = next((msg.message for msg in messages if msg.message), "")
+        if album_text:
+            album_text = re.sub(r"SID:\s*-?\d+\s*\|\s*MID:\s*\d+\n?", "", album_text).strip()
+            
         sent = None
         
         # Determine the file/media to send
@@ -2073,6 +2080,29 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
             files_to_send = [m for m in messages if m.media]
             
         file_to_send = files_to_send if len(files_to_send) > 1 else (files_to_send[0] if files_to_send else None)
+
+        # FIX: Attempt native forward first to preserve the "Forwarded From" tag layout if not restricted
+        try:
+            # Only do native clone if not running an absolute fallback download scheme and no metadata tags present
+            has_metadata = any(m.message and ("SID:" in m.message or "MID:" in m.message) for m in messages)
+            if not pre_downloaded and not has_metadata:
+                sent = await client.forward_messages(
+                    entity=target_entity,
+                    messages=messages,
+                    from_peer=int(sid),
+                    reply_to=reply_header
+                )
+                if sent:
+                    if isinstance(sent, list) and len(sent) == len(messages):
+                        for orig_m, new_m in zip(messages, sent):
+                            save_message_mapping(sid, orig_m.id, tid, new_m.id)
+                    else:
+                        first_id = sent[0].id if isinstance(sent, list) else sent.id
+                        save_message_mapping(sid, first_msg.id, tid, first_id)
+                    logger.info(f"✅ MIRROR: Forwarded natively to {tid}")
+                    return
+        except Exception as native_err:
+            logger.warning(f"Native forward mirroring failed: {native_err}. Utilizing file fallback upload style...")
         
         for attempt in range(3):
             try:
@@ -2452,6 +2482,16 @@ def setup_automation_handlers(client: TelegramClient):
     async def auto_handler(event):
         m = event.message
         if not m: return
+
+        # FIX: Filter out Telegram service actions/topic events and empty text entries
+        if hasattr(m, 'action') and m.action is not None:
+            logger.info(f"⏭️ Skipping service/topic action event in chat {event.chat_id}")
+            return
+        
+        # Check if message is entirely empty (no text content and no attachments/media)
+        if not m.text and not m.media:
+            logger.info(f"⏭️ Skipping empty message event {m.id} in chat {event.chat_id}")
+            return
 
         # FAST DROP: Immediately ignore messages if the source chat isn't in configured pairs
         # This prevents unconfigured active channels from flooding your CPU loop
@@ -5683,6 +5723,10 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                     continue
                 if release_filter == "text" and msg.media:
                     continue
+
+                # FIX: Strip out metadata text blocks safely before presenting to destination chat
+                if msg.message:
+                    msg.message = re.sub(r"SID:\s*-?\d+\s*\|\s*MID:\s*\d+\n?", "", msg.message).strip()
 
                 target_topic_anchor = t_topic
                 
