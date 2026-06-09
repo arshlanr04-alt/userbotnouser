@@ -4625,7 +4625,8 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     target_chat,
                     limit=chunk_size,
                     offset_id=offset_id,
-                    reply_to=target_topic
+                    reply_to=target_topic,
+                    reverse=True
                 )
             
             if not chunk:
@@ -4634,9 +4635,9 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
             for m in chunk:
                 scanned += 1
                 
-                if end_date and m.date > end_date:
-                    continue
                 if start_date and m.date < start_date:
+                    continue
+                if end_date and m.date > end_date:
                     break
  
                 sender_id = m.sender_id
@@ -4658,7 +4659,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
             
             if limit and collected >= limit:
                 break
-            if start_date and chunk[-1].date < start_date:
+            if end_date and chunk[-1].date > end_date:
                 break
                 
             offset_id = chunk[-1].id
@@ -4680,8 +4681,6 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
         if not running_tasks.get(task_key):
             bot.send_message(admin_chat_id, f"🛑 History scrape for `{s_title}` stopped by user.")
             return
-
-        collected_messages.reverse()
         
         grouped_batches = []
         temp_group = []
@@ -5080,7 +5079,8 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     source_chat,
                     limit=cur_limit,
                     offset_id=offset_id,
-                    reply_to=target_topic
+                    reply_to=target_topic,
+                    reverse=True
                 )
                 
             if not chunk:
@@ -5158,8 +5158,6 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         if not running_tasks.get(task_key) and not collected_messages:
             bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user. No messages fetched.")
             return
-
-        collected_messages.reverse()
         
         grouped_batches = []
         temp_group = []
@@ -5250,17 +5248,50 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                 sent_count += len(matching_batch)
                         else:
                             try:
-                                target_entity = await resolve_target_id(userbot, tid)
-                                is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
-                                top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
-                                
-                                fwd_res = await userbot(functions.messages.ForwardMessagesRequest(
-                                    from_peer=src_peer,
-                                    id=[msg.id for msg in matching_batch],
-                                    to_peer=target_entity,
-                                    random_id=random_ids,
-                                    top_msg_id=top_msg_id_val
-                                ))
+                                async with userbot_lock:
+                                    src_peer = await userbot.get_input_entity(int(sid))
+                                    tgt_peer = await userbot.get_input_entity(int(tid))
+                                    dest_topic_id = t_topic
+                                    if auto_mirror:
+                                        first_msg = matching_batch[0]
+                                        s_top = None
+                                        if first_msg.reply_to:
+                                            s_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
+                                        if s_top:
+                                            mapped_topic = get_topic_mapping(sid, s_top, tid)
+                                            if mapped_topic:
+                                                dest_topic_id = mapped_topic
+                                            else:
+                                                forum = getattr(first_msg.reply_to, "forum_topic", None)
+                                                src_title = getattr(forum, "title", None)
+                                                src_icon = getattr(forum, "icon_emoji_id", None)
+                                                if not src_title:
+                                                    try:
+                                                        res = await userbot(functions.messages.GetForumTopicsRequest(
+                                                            peer=src_peer, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                                        ))
+                                                        for t in res.topics:
+                                                            if t.id == s_top:
+                                                                src_title = t.title
+                                                                src_icon = getattr(t, "icon_emoji_id", None)
+                                                                break
+                                                    except Exception: pass
+                                                if src_title:
+                                                    dest_topic_id = await get_or_create_target_topic(userbot, tid, src_title, sid, s_top, icon_emoji_id=src_icon)
+
+                                    import random
+                                    random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in matching_batch]
+                                    target_entity = await resolve_target_id(userbot, tid)
+                                    is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
+                                    top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
+                                    
+                                    fwd_res = await userbot(functions.messages.ForwardMessagesRequest(
+                                        from_peer=src_peer,
+                                        id=[msg.id for msg in matching_batch],
+                                        to_peer=target_entity,
+                                        random_id=random_ids,
+                                        top_msg_id=top_msg_id_val
+                                    ))
                                 if fwd_res:
                                     fwd_msgs = []
                                     if hasattr(fwd_res, 'updates'):
@@ -5273,7 +5304,8 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                 sent_count += len(matching_batch)
                             except Exception as fwd_err:
                                 logger.error(f"Native Forward in collection failed ({fwd_err}). Falling back to mirror...")
-                                await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid)
+                                async with userbot_lock:
+                                    await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid)
                                 sent_count += len(matching_batch)
                     except Exception as fe:
                         logger.error(f"Failed to forward batch: {fe}")
