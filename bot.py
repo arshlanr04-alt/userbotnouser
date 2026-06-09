@@ -2098,9 +2098,9 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
             except (errors.rpcerrorlist.WorkerBusyTooLongRetryError, errors.rpcerrorlist.TimedOutError):
                 await asyncio.sleep(2)
             except Exception as e:
-                # If the error is due to protected/restricted media, try downloading and uploading it
+                # If the error is due to protected/restricted/invalid media, try downloading and uploading it
                 err_msg = str(e).lower()
-                is_protected_error = any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer", "empty"])
+                is_protected_error = any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer", "empty", "invalid or you can't do that operation"])
                 
                 # Check if we should attempt download & upload fallback
                 if is_protected_error and not pre_downloaded and not downloaded_files and any(m.media for m in messages):
