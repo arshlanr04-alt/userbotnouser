@@ -2163,6 +2163,8 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                     
                     if downloaded_files:
                         file_to_send = downloaded_files if len(downloaded_files) > 1 else downloaded_files[0]
+                        # Set pre_downloaded to downloaded_files to let subsequent send attempts/loops reuse it
+                        pre_downloaded = downloaded_files
                         # Retry sending immediately in this attempt using the local file
                         try:
                             sent = await client.send_message(
