@@ -302,9 +302,6 @@ def init_db():
                     source_chat_id BIGINT,
                     source_msg_id BIGINT,
                     grouped_id BIGINT,
-                    source_topic_id BIGINT,
-                    source_topic_title TEXT,
-                    source_topic_icon BIGINT,
                     file_id TEXT,
                     media_type TEXT,
                     caption TEXT,
@@ -315,12 +312,6 @@ def init_db():
             try: c.execute("ALTER TABLE log_media ADD COLUMN grouped_id BIGINT")
             except: pass
             try: c.execute("ALTER TABLE log_media ADD COLUMN log_msg_id BIGINT")
-            except: pass
-            try: c.execute("ALTER TABLE log_media ADD COLUMN source_topic_id BIGINT")
-            except: pass
-            try: c.execute("ALTER TABLE log_media ADD COLUMN source_topic_title TEXT")
-            except: pass
-            try: c.execute("ALTER TABLE log_media ADD COLUMN source_topic_icon BIGINT")
             except: pass
 
             # Banned Users Table
@@ -469,10 +460,6 @@ def init_db():
                     log_msg_id BIGINT,
                     source_chat_id BIGINT,
                     source_msg_id BIGINT,
-                    grouped_id BIGINT,
-                    source_topic_id BIGINT,
-                    source_topic_title TEXT,
-                    source_topic_icon BIGINT,
                     file_id TEXT,
                     media_type TEXT,
                     caption TEXT,
@@ -481,14 +468,6 @@ def init_db():
                 )
             """)
             try: c.execute("ALTER TABLE log_media ADD COLUMN log_msg_id BIGINT")
-            except: pass
-            try: c.execute("ALTER TABLE log_media ADD COLUMN grouped_id BIGINT")
-            except: pass
-            try: c.execute("ALTER TABLE log_media ADD COLUMN source_topic_id BIGINT")
-            except: pass
-            try: c.execute("ALTER TABLE log_media ADD COLUMN source_topic_title TEXT")
-            except: pass
-            try: c.execute("ALTER TABLE log_media ADD COLUMN source_topic_icon BIGINT")
             except: pass
 
             # Banned Users Table
@@ -823,88 +802,6 @@ def get_topic_mapping(s_chat, s_topic, t_chat):
         row = c.fetchone()
         return row[0] if row else None
 
-
-async def forward_natively(client, entity, messages, from_peer, top_msg_id=None):
-    """
-    Safely forwards messages natively.
-    If top_msg_id is provided, it uses ForwardMessagesRequest with top_msg_id.
-    Otherwise, it uses client.forward_messages.
-    Returns the sent message object or a list of sent message objects (matching input structure).
-    """
-    import random
-    if not messages:
-        return []
-    
-    is_single = not isinstance(messages, list)
-    msg_list = [messages] if is_single else messages
-
-    if top_msg_id is not None:
-        try:
-            to_peer = await client.get_input_entity(entity)
-            from_peer_input = await client.get_input_entity(from_peer)
-            
-            msg_ids = [m.id if hasattr(m, 'id') else int(m) for m in msg_list]
-            random_ids = [random.randint(-2**63, 2**63 - 1) for _ in msg_ids]
-            
-            req = functions.messages.ForwardMessagesRequest(
-                from_peer=from_peer_input,
-                id=msg_ids,
-                to_peer=to_peer,
-                random_id=random_ids,
-                top_msg_id=int(top_msg_id)
-            )
-            result = await client(req)
-            
-            sent_msgs = []
-            if isinstance(result, types.Updates):
-                for update in result.updates:
-                    if isinstance(update, (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
-                        sent_msgs.append(update.message)
-            
-            if is_single:
-                return sent_msgs[0] if sent_msgs else None
-            return sent_msgs
-        except Exception as e:
-            logger.error(f"Error in ForwardMessagesRequest with top_msg_id {top_msg_id}: {e}")
-            raise e
-    else:
-        return await client.forward_messages(
-            entity=entity,
-            messages=messages,
-            from_peer=from_peer
-        )
-
-
-async def get_message_topic_details(client, orig_m, source_chat_id):
-    """
-    Resolves the topic ID, title, and icon for a given message.
-    """
-    s_top = None
-    src_title = None
-    src_icon = None
-    if getattr(orig_m, 'reply_to', None):
-        s_top = getattr(orig_m.reply_to, 'reply_to_top_id', None) or orig_m.reply_to.reply_to_msg_id
-        if s_top:
-            # Try to get title from message's forum_topic attribute
-            forum = getattr(orig_m.reply_to, "forum_topic", None)
-            src_title = getattr(forum, "title", None)
-            src_icon = getattr(forum, "icon_emoji_id", None)
-            if not src_title:
-                try:
-                    source_peer = await resolve_target_id(client, source_chat_id)
-                    res = await client(functions.messages.GetForumTopicsRequest(
-                        peer=source_peer, offset_date=0, offset_id=0, offset_topic=0, limit=100
-                    ))
-                    for t in res.topics:
-                        if t.id == s_top:
-                            src_title = t.title
-                            src_icon = getattr(t, "icon_emoji_id", None)
-                            break
-                except Exception:
-                    pass
-    return s_top, src_title, src_icon
-
-
 def save_message_mapping(s_chat, s_msg, t_chat, t_msg):
     with db_conn() as conn:
         c = conn.cursor()
@@ -1014,7 +911,7 @@ def get_vaulted_media_for_source(source_id, bot_id=None, limit=None):
         p = get_placeholder()
         
         query = f"""
-            SELECT m.source_msg_id, m.file_id, m.media_type, m.caption, m.log_msg_id, m.bot_id, m.grouped_id, m.source_topic_id, m.source_topic_title, m.source_topic_icon
+            SELECT m.source_msg_id, m.file_id, m.media_type, m.caption, m.log_msg_id, m.bot_id, m.grouped_id
             FROM log_media m
             WHERE m.source_chat_id = {p}
         """
@@ -1153,13 +1050,6 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
             
         total_groups = len(grouped_items)
         
-        is_target_forum = False
-        try:
-            tgt_ent = await userbot.get_input_entity(int(target_id))
-            is_target_forum = getattr(tgt_ent, 'forum', False) if hasattr(tgt_ent, 'forum') else False
-        except Exception as e:
-            logger.warning(f"Could not resolve target forum status: {e}")
-
         for i, group in enumerate(grouped_items):
             if not running_tasks.get(task_key):
                 sender_bot.send_message(admin_chat_id, "🛑 *Release Stopped* by user.")
@@ -1172,19 +1062,6 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                 log_msg_ids = [int(it[4]) for it in group]
                 captions = [it[3] for it in group]
                 
-                # Fetch original topic details from log_media
-                src_top_id = first_item[7] if len(first_item) > 7 else None
-                src_top_title = first_item[8] if len(first_item) > 8 else None
-                src_top_icon = first_item[9] if len(first_item) > 9 else None
-                
-                current_target_topic = target_topic_id
-                if is_target_forum and src_top_id and src_top_title:
-                    resolved_topic_id = await get_or_create_target_topic(
-                        userbot, int(target_id), src_top_title, source_id, src_top_id, icon_emoji_id=src_top_icon
-                    )
-                    if resolved_topic_id:
-                        current_target_topic = resolved_topic_id
-
                 log_bot_entity = await userbot.get_input_entity(int(bot_id))
                 
                 # Fetch all messages in the group from the log bot
@@ -1197,57 +1074,24 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                     msgs_to_forward = [m for m in msgs_to_forward if m]
                     
                     if msgs_to_forward:
-                        # FIX: Extract and clean raw captions by removing SID/MID patterns dynamically
-                        raw_caption = next((c for c in captions if c), "")
-                        clean_caption = re.sub(r"SID:\s*-?\d+\s*\|\s*MID:\s*\d+\n?", "", raw_caption).strip()
+                        # Use the first available caption for the album
+                        main_caption = next((c for c in captions if c), "")
                         
                         try:
-                            # Forward natively if unrestricted and clean of metadata tags to preserve forward tag layout
-                            has_metadata = any(m.message and ("SID:" in m.message or "MID:" in m.message) for m in msgs_to_forward)
-                            if has_metadata:
-                                raise ValueError("Metadata tags present in vault messages; forcing upload fallback to strip tags.")
-                            
-                            await forward_natively(
-                                client=userbot,
+                            # Forward natively to preserve the forward tag and speed up the transfer
+                            await userbot.forward_messages(
                                 entity=int(target_id),
                                 messages=msgs_to_forward,
-                                from_peer=int(bot_id),
-                                top_msg_id=int(current_target_topic) if (is_target_forum and current_target_topic) else None
+                                reply_to=target_topic_id if target_topic_id else None
                             )
                         except Exception as fwd_err:
-                            logger.warning(f"Failed to forward natively in vault release: {fwd_err}. Falling back to clean upload.")
-                            
-                            media_files = []
-                            downloaded_paths = []
-                            for m in msgs_to_forward:
-                                if m.media:
-                                    try:
-                                        path = await userbot.download_media(m)
-                                        if path:
-                                            media_files.append(path)
-                                            downloaded_paths.append(path)
-                                    except Exception as dl_err:
-                                        logger.error(f"Failed to download media for vault release fallback: {dl_err}")
-                            
-                            try:
-                                file_arg = media_files if len(media_files) > 1 else (media_files[0] if media_files else None)
-                                if not file_arg and any(m.media for m in msgs_to_forward):
-                                    file_arg = [m.media for m in msgs_to_forward] if len(msgs_to_forward) > 1 else msgs_to_forward[0].media
-                                
-                                if not clean_caption and not file_arg:
-                                    logger.info("Skipping vault release fallback send since the message is completely empty after cleaning.")
-                                else:
-                                    await userbot.send_message(
-                                        entity=int(target_id),
-                                        message=clean_caption,
-                                        file=file_arg,
-                                        reply_to=int(current_target_topic) if current_target_topic else None 
-                                    )
-                            finally:
-                                for path in downloaded_paths:
-                                    if os.path.exists(path):
-                                        try: os.remove(path)
-                                        except Exception: pass
+                            logger.warning(f"Failed to forward natively in vault release: {fwd_err}. Falling back to send_message.")
+                            await userbot.send_message(
+                                entity=int(target_id),
+                                message=main_caption,
+                                file=[m.media for m in msgs_to_forward] if len(msgs_to_forward) > 1 else msgs_to_forward[0].media,
+                                reply_to=target_topic_id if target_topic_id else None 
+                            )
                         success += len(msgs_to_forward)
                     else:
                         failed += len(group)
@@ -1270,33 +1114,27 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
     finally:
         running_tasks.pop(task_key, None)
 
-def save_logged_media(bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id=None, source_topic_id=None, source_topic_title=None, source_topic_icon=None):
+def save_logged_media(bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id=None):
     with db_conn() as conn:
         c = conn.cursor()
         p = get_placeholder()
         if USING_POSTGRES:
             c.execute(
-                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id, source_topic_id, source_topic_title, source_topic_icon) 
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) 
+                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id) 
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s) 
                    ON CONFLICT(bot_id, source_chat_id, source_msg_id) DO UPDATE SET 
                    log_msg_id = EXCLUDED.log_msg_id, file_id = EXCLUDED.file_id, 
-                   media_type = EXCLUDED.media_type, caption = EXCLUDED.caption, grouped_id = EXCLUDED.grouped_id,
-                   source_topic_id = COALESCE(EXCLUDED.source_topic_id, log_media.source_topic_id),
-                   source_topic_title = COALESCE(EXCLUDED.source_topic_title, log_media.source_topic_title),
-                   source_topic_icon = COALESCE(EXCLUDED.source_topic_icon, log_media.source_topic_icon)""",
-                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id, source_topic_id, source_topic_title, source_topic_icon)
+                   media_type = EXCLUDED.media_type, caption = EXCLUDED.caption, grouped_id = EXCLUDED.grouped_id""",
+                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id)
             )
         else:
             c.execute(
-                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id, source_topic_id, source_topic_title, source_topic_icon) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO log_media (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id) 
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(bot_id, source_chat_id, source_msg_id) DO UPDATE SET 
                    log_msg_id = excluded.log_msg_id, file_id = excluded.file_id, 
-                   media_type = excluded.media_type, caption = excluded.caption, grouped_id = excluded.grouped_id,
-                   source_topic_id = COALESCE(excluded.source_topic_id, log_media.source_topic_id),
-                   source_topic_title = COALESCE(excluded.source_topic_title, log_media.source_topic_title),
-                   source_topic_icon = COALESCE(excluded.source_topic_icon, log_media.source_topic_icon)""",
-                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id, source_topic_id, source_topic_title, source_topic_icon)
+                   media_type = excluded.media_type, caption = excluded.caption, grouped_id = excluded.grouped_id""",
+                (bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id)
             )
 
 def get_logged_media_stats(bot_id):
@@ -1988,8 +1826,8 @@ async def forward_to_log_bots(client, messages, source_chat_id):
     if not bots: return
     
     for token, username, bot_id in bots:
-        await vault_media(client, messages, int(source_chat_id), int(bot_id), username)
-        await asyncio.sleep(1.0)
+        # Run vaulting in background tasks
+        asyncio.create_task(vault_media(client, messages, int(source_chat_id), int(bot_id), username))
 
 async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
     """Helper to forward to vault and save the permanent File IDs (handles albums)"""
@@ -2005,71 +1843,34 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
         caption_text = metadata + (first_msg.message or "")
         
         is_restricted = False
-        auto_mirror = False
         try:
             source_chat = await resolve_target_id(client, source_chat_id)
             if getattr(source_chat, 'noforwards', False):
                 is_restricted = True
-            if getattr(source_chat, 'forum', False) and getattr(target_peer, 'forum', False):
-                auto_mirror = True
         except Exception:
-            source_chat = int(source_chat_id)
+            pass
 
-        # Resolve source topic details
-        s_top, src_title, src_icon = await get_message_topic_details(client, first_msg, source_chat_id)
-        
-        dest_topic_id = None
-        if auto_mirror and s_top:
-            mapped = get_topic_mapping(source_chat_id, s_top, log_chat_id)
-            if mapped:
-                dest_topic_id = mapped
-            elif src_title:
-                dest_topic_id = await get_or_create_target_topic(
-                    client, log_chat_id, src_title, source_chat_id, s_top, icon_emoji_id=src_icon
-                )
-
-        vaulted_result = None
-        downloaded_paths = []
         try:
             if not is_restricted:
                 try:
-                    # Check if target is a forum
-                    is_target_forum = getattr(target_peer, 'forum', False) if not isinstance(target_peer, int) else False
-                    vaulted_result = await forward_natively(
-                        client=client,
+                    vaulted_result = await client.forward_messages(
                         entity=target_peer,
                         messages=messages,
-                        from_peer=source_chat_id,
-                        top_msg_id=int(dest_topic_id) if (is_target_forum and dest_topic_id) else None
+                        from_peer=source_chat_id
                     )
                 except Exception as fwd_err:
-                    logger.warning(f"Native forward to vault failed: {fwd_err}. Falling back to send_message with download/upload.")
-
-            if not vaulted_result:
-                # Fallback: download and upload
-                media_files = []
-                for m in messages:
-                    if m.media:
-                        try:
-                            path = await client.download_media(m)
-                            if path:
-                                media_files.append(path)
-                                downloaded_paths.append(path)
-                        except Exception as dl_err:
-                            logger.error(f"Failed to download media for vault upload: {dl_err}")
-                
-                file_arg = media_files if len(media_files) > 1 else (media_files[0] if media_files else None)
-                
-                # Check if message is empty (no text and no media)
-                if not caption_text and not file_arg:
-                    logger.info("Skipping vaulting since the message is empty after cleaning.")
-                else:
+                    logger.warning(f"Native forward to vault failed: {fwd_err}. Falling back to send_message.")
                     vaulted_result = await client.send_message(
                         entity=target_peer,
-                        file=file_arg,
-                        message=caption_text,
-                        reply_to=int(dest_topic_id) if dest_topic_id else None
+                        file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
+                        message=caption_text
                     )
+            else:
+                vaulted_result = await client.send_message(
+                    entity=target_peer,
+                    file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
+                    message=caption_text
+                )
             await asyncio.sleep(2)
         except errors.FloodWaitError as fwe:
             logger.warning(f"⏳ VAULT FLOOD: Waiting {fwe.seconds}s...")
@@ -2080,11 +1881,6 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
                 logger.warning(f"🛡️ VAULT: Protected media detected but could not forward to vault bot. Vaulting skipped.")
             else:
                 raise e
-        finally:
-            for path in downloaded_paths:
-                if os.path.exists(path):
-                    try: os.remove(path)
-                    except Exception: pass
             
         if vaulted_result:
             # vaulted_result is a list if it was an album, or a single Message object
@@ -2101,10 +1897,7 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
                     file_id=None,
                     media_type=type(orig_m.media).__name__ if orig_m.media else "text",
                     caption=orig_m.message or "",
-                    grouped_id=orig_m.grouped_id,
-                    source_topic_id=s_top,
-                    source_topic_title=src_title,
-                    source_topic_icon=src_icon
+                    grouped_id=orig_m.grouped_id
                 )
     except Exception as e:
         logger.error(f"VAULT ERROR for @{t_name}: {e}")
@@ -2219,9 +2012,6 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
 
         # 4. Send Content
         album_text = next((msg.message for msg in messages if msg.message), "")
-        if album_text:
-            album_text = re.sub(r"SID:\s*-?\d+\s*\|\s*MID:\s*\d+\n?", "", album_text).strip()
-            
         sent = None
         
         # Determine the file/media to send
@@ -2245,49 +2035,6 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
             files_to_send = [m for m in messages if m.media]
             
         file_to_send = files_to_send if len(files_to_send) > 1 else (files_to_send[0] if files_to_send else None)
-
-        sent = None
-        
-        # FIX: Attempt native forward first to preserve the "Forwarded From" tag layout if not restricted
-        try:
-            # Only do native clone if not running an absolute fallback download scheme and no metadata tags present
-            has_metadata = any(m.message and ("SID:" in m.message or "MID:" in m.message) for m in messages)
-            if not pre_downloaded and not has_metadata:
-                sent = await forward_natively(
-                    client=client,
-                    entity=target_entity,
-                    messages=messages,
-                    from_peer=int(sid),
-                    top_msg_id=int(dest_topic_id) if (is_forum and dest_topic_id) else None
-                )
-                if sent:
-                    if isinstance(sent, list) and len(sent) == len(messages):
-                        for orig_m, new_m in zip(messages, sent):
-                            save_message_mapping(sid, orig_m.id, tid, new_m.id)
-                    else:
-                        first_id = sent[0].id if isinstance(sent, list) else sent.id
-                        save_message_mapping(sid, first_msg.id, tid, first_id)
-                    logger.info(f"✅ MIRROR: Forwarded natively to {tid}")
-                    return
-        except Exception as native_err:
-            logger.warning(f"Native forward mirroring failed: {native_err}. Utilizing file fallback upload style...")
-
-        # If native forward was skipped or failed, and it is an album that is not pre_downloaded, download it now
-        if not sent and len(files_to_send) > 1 and not pre_downloaded:
-            logger.info("Downloading album media to local temp files for upload fallback...")
-            for m in files_to_send:
-                try:
-                    path = await client.download_media(m)
-                    if path:
-                        downloaded_files.append(path)
-                except Exception as de:
-                    logger.error(f"Album media download failed: {de}")
-            file_to_send = downloaded_files
-
-        # Check if the message is completely empty (no text and no file/media)
-        if not album_text and not file_to_send:
-            logger.info("Skipping sending in mirror since the message is completely empty after cleaning.")
-            return
         
         for attempt in range(3):
             try:
@@ -2623,7 +2370,6 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                         files_to_vault = [media_to_file.get(m.id) or m.media for m in valid_messages if m.media]
                         if files_to_vault:
                             file_payload = files_to_vault if len(files_to_vault) > 1 else files_to_vault[0]
-                            s_top, src_title, src_icon = await get_message_topic_details(client, first_msg, source_chat_id)
                             for token, username, bot_id in get_log_bots():
                                 metadata = f"SID: {source_chat_id} | MID: {first_msg.id}\n"
                                 caption_text = metadata + (first_msg.message or "")
@@ -2642,8 +2388,7 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                                                     bot_id=int(bot_id), log_msg_id=int(v_m.id),
                                                     source_chat_id=int(source_chat_id), source_msg_id=int(orig_m.id),
                                                     file_id=None, media_type=type(orig_m.media).__name__ if orig_m.media else "text",
-                                                    caption=orig_m.message or "", grouped_id=orig_m.grouped_id,
-                                                    source_topic_id=s_top, source_topic_title=src_title, source_topic_icon=src_icon
+                                                    caption=orig_m.message or "", grouped_id=orig_m.grouped_id
                                                 )
                                 except Exception as e:
                                     logger.error(f"Error executing backup synchronization pipeline: {e}")
@@ -2669,16 +2414,6 @@ def setup_automation_handlers(client: TelegramClient):
     async def auto_handler(event):
         m = event.message
         if not m: return
-
-        # FIX: Filter out Telegram service actions/topic events and empty text entries
-        if hasattr(m, 'action') and m.action is not None:
-            logger.info(f"⏭️ Skipping service/topic action event in chat {event.chat_id}")
-            return
-        
-        # Check if message is entirely empty (no text content and no attachments/media)
-        if not m.text and not m.media:
-            logger.info(f"⏭️ Skipping empty message event {m.id} in chat {event.chat_id}")
-            return
 
         # FAST DROP: Immediately ignore messages if the source chat isn't in configured pairs
         # This prevents unconfigured active channels from flooding your CPU loop
@@ -5158,7 +4893,6 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                         files_to_vault = [media_to_file.get(m.id) for m in batch if m.id in media_to_file]
                         if files_to_vault:
                             file_payload = files_to_vault if len(files_to_vault) > 1 else files_to_vault[0]
-                            s_top, src_title, src_icon = await get_message_topic_details(userbot, batch[0], sid)
                             for token, username, bot_id in get_log_bots():
                                 metadata = f"SID: {sid} | MID: {batch[0].id}\n"
                                 caption_text = metadata + (batch[0].message or "")
@@ -5181,15 +4915,12 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                                                 file_id=None,
                                                 media_type=type(orig_m.media).__name__ if orig_m.media else "text",
                                                 caption=orig_m.message or "",
-                                                grouped_id=orig_m.grouped_id,
-                                                source_topic_id=s_top,
-                                                source_topic_title=src_title,
-                                                source_topic_icon=src_icon
+                                                grouped_id=orig_m.grouped_id
                                             )
                                 except Exception as e:
                                     logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
                     else:
-                        await forward_to_log_bots(userbot, batch, sid)
+                        asyncio.create_task(forward_to_log_bots(userbot, batch, sid))
             finally:
                 for temp_path in media_to_file.values():
                     if os.path.exists(temp_path):
@@ -5645,7 +5376,6 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                         """,
                                         (pair_id, sid, m.id, m_type, m.message or "", rel_val)
                                     )
-                        if not USING_POSTGRES or not DATABASE_URL:
                             conn.commit()
 
                         # Send to log bots
@@ -5654,32 +5384,14 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                 files_to_vault = [media_to_file.get(m.id) for m in batch if m.id in media_to_file]
                                 if files_to_vault or not any(m.media for m in batch):
                                     file_payload = files_to_vault if len(files_to_vault) > 1 else (files_to_vault[0] if files_to_vault else None)
-                                    s_top, src_title, src_icon = await get_message_topic_details(userbot, batch[0], sid)
                                     for token, username, bot_id in get_log_bots():
                                         metadata = f"SID: {sid} | MID: {batch[0].id}\n"
                                         caption_text = metadata + (batch[0].message or "")
-                                        
-                                        # Resolve vault topic mirroring
-                                        vault_topic_id = None
-                                        try:
-                                            vault_entity = await resolve_target_id(userbot, int(bot_id))
-                                            if getattr(source_chat, 'forum', False) and getattr(vault_entity, 'forum', False) and s_top:
-                                                mapped = get_topic_mapping(sid, s_top, int(bot_id))
-                                                if mapped:
-                                                    vault_topic_id = mapped
-                                                elif src_title:
-                                                    vault_topic_id = await get_or_create_target_topic(
-                                                        userbot, int(bot_id), src_title, sid, s_top, icon_emoji_id=src_icon
-                                                    )
-                                        except Exception as topic_err:
-                                            logger.error(f"Error resolving topic for vault group {bot_id}: {topic_err}")
-
                                         try:
                                             vaulted_result = await userbot.send_message(
                                                 entity=int(bot_id),
                                                 file=file_payload,
-                                                message=caption_text,
-                                                reply_to=int(vault_topic_id) if vault_topic_id else None
+                                                message=caption_text
                                             )
                                             if vaulted_result:
                                                 v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
@@ -5693,15 +5405,12 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                                         file_id=None,
                                                         media_type=type(orig_m.media).__name__ if orig_m.media else "text",
                                                         caption=orig_m.message or "",
-                                                        grouped_id=orig_m.grouped_id,
-                                                        source_topic_id=s_top,
-                                                        source_topic_title=src_title,
-                                                        source_topic_icon=src_icon
+                                                        grouped_id=orig_m.grouped_id
                                                     )
                                         except Exception as e:
                                             logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
                             else:
-                                await forward_to_log_bots(userbot, batch, sid)
+                                asyncio.create_task(forward_to_log_bots(userbot, batch, sid))
                     finally:
                         for temp_path in media_to_file.values():
                             if os.path.exists(temp_path):
@@ -5712,7 +5421,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                             "sent_count": sent_count
                         })
                         
-                    if (curr_instant and matching_batch) or (should_vault and batch):
+                    if curr_instant and matching_batch:
                         # Gradual release sleep delay to avoid bulk flood
                         await asyncio.sleep(1.2)
 
@@ -5784,18 +5493,12 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
         if not row: return
         sid_ref, tid_ref, s_title, is_mir, s_topic, t_topic, cf = row
     
-        source_chat = None
-        source_accessible = False
         try:
+            # Pre-resolve entities to warm up Telethon cache and ensure access
             source_chat = await resolve_target_id(userbot, sid_ref)
-            source_accessible = True
-        except Exception as se:
-            logger.warning(f"Source chat {sid_ref} is not accessible: {se}. Releasing via vault fallback.")
-            
-        try:
             target_chat = await resolve_target_id(userbot, tid_ref)
         except Exception as e:
-            bot.send_message(admin_chat_id, f"❌ Connection Error: {e}\n\nMake sure the bot is a member of the target chat.")
+            bot.send_message(admin_chat_id, f"❌ Connection Error: {e}\n\nMake sure the bot is a member of both chats.")
             return
 
         # Map added_by filter for query backward compatibility
@@ -5836,36 +5539,9 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
             
             advance = True
             try:
-                msg = None
-                from_vault = False
-                vault_bot_id = None
-                
-                if source_accessible and source_chat:
-                    try:
-                        msg = await userbot.get_messages(source_chat, ids=smid)
-                    except Exception as ge:
-                        logger.warning(f"Could not get message {smid} from source: {ge}. Trying vault.")
-                
+                msg = await userbot.get_messages(source_chat, ids=smid)
                 if not msg:
-                    # Try to fetch from vault bot mapping
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        p = get_placeholder()
-                        c.execute(f"SELECT bot_id, log_msg_id FROM log_media WHERE source_chat_id = {p} AND source_msg_id = {p}", (sid_ref, smid))
-                        vault_row = c.fetchone()
-                    
-                    if vault_row:
-                        vault_bot_id, vault_msg_id = vault_row
-                        try:
-                            vault_chat = await resolve_target_id(userbot, vault_bot_id)
-                            msg = await userbot.get_messages(vault_chat, ids=vault_msg_id)
-                            if msg:
-                                from_vault = True
-                        except Exception as ve:
-                            logger.error(f"Failed to fetch message {smid} from vault bot {vault_bot_id}: {ve}")
-                
-                if not msg:
-                    # Message is completely inaccessible, mark as skipped so we don't loop
+                    # Message is deleted/empty, mark it as inaccessible/skipped so we don't loop on it
                     with db_conn() as conn:
                         c = conn.cursor()
                         p = get_placeholder()
@@ -5899,54 +5575,27 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                 if release_filter == "text" and msg.media:
                     continue
 
-                # FIX: Strip out metadata text blocks safely before presenting to destination chat
-                if msg.message:
-                    msg.message = re.sub(r"SID:\s*-?\d+\s*\|\s*MID:\s*\d+\n?", "", msg.message).strip()
-
-                # Prevent empty message exception if both text and media are empty after cleaning
-                if not msg.message and not msg.media:
-                    logger.info(f"Skipping release of message {row_id} as it is empty after cleaning.")
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        p = get_placeholder()
-                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
-                        conn.commit()
-                    continue
-
                 target_topic_anchor = t_topic
                 
                 # Determine if BOTH chats are forums to automatically mirror topics
                 auto_mirror = False
-                is_source_forum = getattr(source_chat, 'forum', False) if source_accessible else True # Try mapping if target is forum
-                if is_source_forum and getattr(target_chat, 'forum', False):
+                if getattr(source_chat, 'forum', False) and getattr(target_chat, 'forum', False):
                     auto_mirror = True
 
                 # Handle Mirroring ID detection for release
                 if auto_mirror:
-                    s_top = None
-                    if from_vault and vault_bot_id:
-                        v_top = getattr(msg.reply_to, 'reply_to_top_id', None) or (msg.reply_to.reply_to_msg_id if msg.reply_to else None)
-                        if v_top:
-                            with db_conn() as conn:
-                                c = conn.cursor()
-                                p = get_placeholder()
-                                c.execute(f"SELECT source_topic_id FROM topic_mappings WHERE source_chat_id = {p} AND target_topic_id = {p} AND target_chat_id = {p}", (sid_ref, v_top, vault_bot_id))
-                                row_t = c.fetchone()
-                                if row_t:
-                                    s_top = row_t[0]
-                    else:
-                        s_top = getattr(msg.reply_to, 'reply_to_top_id', None) or (msg.reply_to.reply_to_msg_id if msg.reply_to else None)
-                        if not s_top and getattr(msg, 'forum_topic', False):
-                            s_top = msg.id
-                        if not s_top and msg.reply_to_msg_id:
-                            s_top = msg.reply_to_msg_id
+                    s_top = getattr(msg.reply_to, 'reply_to_top_id', None) or (msg.reply_to.reply_to_msg_id if msg.reply_to else None)
+                    if not s_top and getattr(msg, 'forum_topic', False):
+                        s_top = msg.id
+                    if not s_top and msg.reply_to_msg_id:
+                        s_top = msg.reply_to_msg_id
                     
                     if s_top:
                         # Priority check database mapping
                         mapped = get_topic_mapping(sid_ref, s_top, tid_ref)
                         if mapped:
                             target_topic_anchor = mapped
-                        elif source_accessible:
+                        else:
                             # Search for title/icon in source chat to mirror dynamically
                             forum = getattr(msg.reply_to, "forum_topic", None) if msg.reply_to else None
                             src_title = getattr(forum, "title", None)
@@ -5972,20 +5621,8 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
 
                 # Resolve reply mapping
                 reply_to_val = None
-                src_reply_msg_id = None
-                if from_vault and vault_bot_id and getattr(msg, "reply_to_msg_id", None):
-                    with db_conn() as conn:
-                        c = conn.cursor()
-                        p = get_placeholder()
-                        c.execute(f"SELECT source_msg_id FROM log_media WHERE bot_id = {p} AND log_msg_id = {p}", (vault_bot_id, msg.reply_to_msg_id))
-                        row_r = c.fetchone()
-                        if row_r:
-                            src_reply_msg_id = row_r[0]
-                elif not from_vault and getattr(msg, "reply_to_msg_id", None):
-                    src_reply_msg_id = msg.reply_to_msg_id
-                    
-                if src_reply_msg_id:
-                    reply_to_val = get_message_mapping(sid_ref, src_reply_msg_id, tid_ref)
+                if getattr(msg, "reply_to_msg_id", None):
+                    reply_to_val = get_message_mapping(sid_ref, msg.reply_to_msg_id, tid_ref)
 
                 # Construct Topic Header
                 # If it's a specific reply, use it. Otherwise, use the Topic Header ID.
