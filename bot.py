@@ -1888,12 +1888,28 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
         try:
             if not is_restricted:
                 try:
-                    vaulted_result = await client.forward_messages(
-                        entity=target_peer,
-                        messages=messages,
-                        from_peer=source_chat_id,
-                        comment_to=int(dest_topic_id) if dest_topic_id else None
-                    )
+                    import random
+                    random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in messages]
+                    is_forum = getattr(target_peer, 'forum', False) if not isinstance(target_peer, int) else False
+                    top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
+                    
+                    sent_fwd = await client(functions.messages.ForwardMessagesRequest(
+                        from_peer=await client.get_input_entity(int(source_chat_id)),
+                        id=[msg.id for msg in messages],
+                        to_peer=target_peer,
+                        random_id=random_ids,
+                        top_msg_id=top_msg_id_val
+                    ))
+                    
+                    if sent_fwd:
+                        fwd_msgs = []
+                        if hasattr(sent_fwd, 'updates'):
+                            for u in sent_fwd.updates:
+                                if type(u).__name__ in ["UpdateNewMessage", "UpdateNewChannelMessage"]:
+                                    fwd_msgs.append(u.message)
+                        vaulted_result = fwd_msgs if len(fwd_msgs) > 1 else (fwd_msgs[0] if fwd_msgs else None)
+                    else:
+                        vaulted_result = None
                 except Exception as fwd_err:
                     logger.warning(f"Native forward to vault failed: {fwd_err}. Falling back to send_message.")
                     vaulted_result = await client.send_message(
@@ -2084,19 +2100,29 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                 # Attempt native forward first if not restricted/pre-downloaded to preserve the forward tag
                 if not pre_downloaded and not downloaded_files:
                     try:
-                        # forward_messages takes comment_to for threads/topics or a simple forward mapping
-                        # Telethon's forward_messages does not take reply_to. It accepts comment_to.
-                        sent = await client.forward_messages(
-                            entity=target_entity,
-                            messages=messages,
-                            from_peer=int(sid),
-                            comment_to=reply_header
-                        )
-                        if sent:
-                            first_id = sent[0].id if isinstance(sent, list) else sent.id
-                            logger.info(f"✅ MIRROR: Sent via native forward to {tid} -> MSG ID: {first_id}")
-                            save_message_mapping(sid, first_msg.id, tid, first_id)
-                            break
+                        import random
+                        random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in messages]
+                        top_msg_id_val = int(reply_header) if (is_forum and reply_header) else None
+                        
+                        sent_fwd = await client(functions.messages.ForwardMessagesRequest(
+                            from_peer=await client.get_input_entity(int(sid)),
+                            id=[msg.id for msg in messages],
+                            to_peer=target_entity,
+                            random_id=random_ids,
+                            top_msg_id=top_msg_id_val
+                        ))
+                        if sent_fwd:
+                            fwd_msgs = []
+                            if hasattr(sent_fwd, 'updates'):
+                                for u in sent_fwd.updates:
+                                    if type(u).__name__ in ["UpdateNewMessage", "UpdateNewChannelMessage"]:
+                                        fwd_msgs.append(u.message)
+                            if fwd_msgs:
+                                first_id = fwd_msgs[0].id
+                                sent = fwd_msgs if len(fwd_msgs) > 1 else fwd_msgs[0]
+                                logger.info(f"✅ MIRROR: Sent via native ForwardMessagesRequest to {tid} -> MSG ID: {first_id}")
+                                save_message_mapping(sid, first_msg.id, tid, first_id)
+                                break
                     except Exception as fwd_err:
                         logger.warning(f"Native forward in mirror failed: {fwd_err}. Trying send_message copy fallback...")
 
