@@ -1826,8 +1826,8 @@ async def forward_to_log_bots(client, messages, source_chat_id):
     if not bots: return
     
     for token, username, bot_id in bots:
-        # Run vaulting in background tasks
-        asyncio.create_task(vault_media(client, messages, int(source_chat_id), int(bot_id), username))
+        await vault_media(client, messages, int(source_chat_id), int(bot_id), username)
+        await asyncio.sleep(1.0)
 
 async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
     """Helper to forward to vault and save the permanent File IDs (handles albums)"""
@@ -4958,7 +4958,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                                 except Exception as e:
                                     logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
                     else:
-                        asyncio.create_task(forward_to_log_bots(userbot, batch, sid))
+                        await forward_to_log_bots(userbot, batch, sid)
             finally:
                 for temp_path in media_to_file.values():
                     if os.path.exists(temp_path):
@@ -5486,7 +5486,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                         except Exception as e:
                                             logger.error(f"Error vaulting pre-downloaded media to bot {bot_id}: {e}")
                             else:
-                                asyncio.create_task(forward_to_log_bots(userbot, batch, sid))
+                                await forward_to_log_bots(userbot, batch, sid)
                     finally:
                         for temp_path in media_to_file.values():
                             if os.path.exists(temp_path):
@@ -5497,7 +5497,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                             "sent_count": sent_count
                         })
                         
-                    if curr_instant and matching_batch:
+                    if (curr_instant and matching_batch) or (should_vault and batch):
                         # Gradual release sleep delay to avoid bulk flood
                         await asyncio.sleep(1.2)
 
