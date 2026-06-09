@@ -1892,7 +1892,7 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
                         entity=target_peer,
                         messages=messages,
                         from_peer=source_chat_id,
-                        reply_to=int(dest_topic_id) if dest_topic_id else None
+                        comment_to=int(dest_topic_id) if dest_topic_id else None
                     )
                 except Exception as fwd_err:
                     logger.warning(f"Native forward to vault failed: {fwd_err}. Falling back to send_message.")
