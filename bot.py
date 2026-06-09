@@ -1056,7 +1056,7 @@ def clear_bot_logs(bot_id):
 
 
 async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, interval=1.5, limit=None, log_target_id=None, target_topic_id=None):
-    """Releases vaulted media using the Userbot while maintaining native layout assemblies."""
+    """Releases vaulted media using the Userbot for forwarding."""
     task_key = f"vault_rel_{source_id}_{target_id}"
     if task_key in running_tasks:
         sender_bot.send_message(admin_chat_id, "⚠️ This release task is already running!")
@@ -1065,11 +1065,13 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
     running_tasks[task_key] = True
     
     try:
+        # Get items to release
         items = get_vaulted_media_for_source(source_id, bot_id=log_target_id)
         if not items:
             sender_bot.send_message(admin_chat_id, "❌ No vaulted items found for this source.")
             return
 
+        # Apply the limit logic
         if limit and isinstance(limit, int):
             items = items[:limit]
 
@@ -1078,16 +1080,16 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
         failed = 0
         
         stop_markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🛑 Stop Transfer", callback_data=f"lb_stop_rel_{task_key}"))
-        status_msg = sender_bot.send_message(admin_chat_id, f"🚀 *Initializing Structural Assembly...*\nItems: `{total}`", parse_mode="Markdown")
+        status_msg = sender_bot.send_message(admin_chat_id, f"🚀 *Initializing Transfer...*\nItems: `{total}`", parse_mode="Markdown")
 
-        # Step 1: Reassemble albums cleanly out of structural database entries
+        # Grouping items by grouped_id or source_msg_id
         grouped_items = []
         last_gid = None
         current_group = []
         
         for item in items:
             # item = (source_msg_id, file_id, m_type, caption, log_msg_id, bot_id, grouped_id)
-            gid = item[6]
+            gid = item[6] # grouped_id
             if gid and gid == last_gid:
                 current_group.append(item)
             else:
@@ -1100,114 +1102,107 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
             
         total_groups = len(grouped_items)
         
-        # Step 2: Extract entity properties
-        target_peer = await resolve_target_id(userbot, int(target_id))
-        is_forum = getattr(target_peer, 'forum', False)
-        
         for i, group in enumerate(grouped_items):
             if not running_tasks.get(task_key):
-                sender_bot.send_message(admin_chat_id, "🛑 *Release Stopped* by administrator.")
+                sender_bot.send_message(admin_chat_id, "🛑 *Release Stopped* by user.")
                 break
             
             try:
+                # Process the group (might be 1 or multiple messages)
                 first_item = group[0]
                 bot_id = first_item[5]
                 log_msg_ids = [int(it[4]) for it in group]
                 captions = [it[3] for it in group]
                 
                 log_bot_entity = await userbot.get_input_entity(int(bot_id))
-                msgs_to_forward = await userbot.get_messages(log_bot_entity, ids=log_msg_ids)
                 
+                # Fetch all messages in the group from the log bot
+                msgs_to_forward = await userbot.get_messages(log_bot_entity, ids=log_msg_ids)
                 if not isinstance(msgs_to_forward, list):
                     msgs_to_forward = [msgs_to_forward] if msgs_to_forward else []
                 
-                msgs_to_forward = [m for m in msgs_to_forward if m]
-                
                 if msgs_to_forward:
-                    # Sanitize captions entirely of tracking parameters
-                    main_caption = next((c for c in captions if c), "")
-                    clean_caption = re.sub(r"SID:\s*-?\d+\s*\|\s*MID:\s*\d+\n?", "", main_caption).strip()
+                    # Filter out None/Failed fetches
+                    msgs_to_forward = [m for m in msgs_to_forward if m]
                     
-                    # Resolve appropriate routing context
-                    final_topic_id = target_topic_id
-                    if is_forum and not final_topic_id:
-                        # Fallback automatic structural lookup
-                        mapped = get_topic_mapping(int(source_id), first_item[0], int(target_id))
-                        if mapped:
-                            final_topic_id = mapped
-                        else:
-                            # Pull clean information headers out of log bot history metrics
-                            final_topic_id = await get_or_create_target_topic(userbot, target_id, "Reclaimed Vault", int(source_id), first_item[0])
-                    
-                    reply_header = int(final_topic_id) if (is_forum and final_topic_id) else None
-                    
-                    # Attempt native structural forward delivery block to map original asset headers cleanly
-                    try:
-                        has_metadata = any(m.message and ("SID:" in m.message or "MID:" in m.message) for m in msgs_to_forward)
-                        if has_metadata:
-                            raise ValueError("Metadata tags present in vault messages; forcing upload fallback to strip tags.")
-                        
-                        await forward_natively(
-                            client=userbot,
-                            entity=target_peer,
-                            messages=msgs_to_forward,
-                            from_peer=int(bot_id),
-                            top_msg_id=reply_header
-                        )
-                    except Exception as fallback_upload:
-                        logger.warning(f"Native structural transfer drop: {fallback_upload}. Reverting to array wrapper upload...")
-                        # Map files explicitly to process continuous album structure parameters
-                        media_files = []
-                        downloaded_paths = []
-                        for m in msgs_to_forward:
-                            if m.media:
-                                try:
-                                    path = await userbot.download_media(m)
-                                    if path:
-                                        media_files.append(path)
-                                        downloaded_paths.append(path)
-                                except Exception as dl_err:
-                                    logger.error(f"Failed to download media for vault release fallback: {dl_err}")
+                    if msgs_to_forward:
+                        # FIX: Extract and clean raw captions by removing SID/MID patterns dynamically
+                        raw_caption = next((c for c in captions if c), "")
+                        clean_caption = re.sub(r"SID:\s*-?\d+\s*\|\s*MID:\s*\d+\n?", "", raw_caption).strip()
                         
                         try:
-                            file_arg = media_files if len(media_files) > 1 else (media_files[0] if media_files else None)
-                            if not file_arg and any(m.media for m in msgs_to_forward):
-                                file_arg = [m.media for m in msgs_to_forward] if len(msgs_to_forward) > 1 else msgs_to_forward[0].media
+                            # Forward natively if unrestricted and clean of metadata tags to preserve forward tag layout
+                            has_metadata = any(m.message and ("SID:" in m.message or "MID:" in m.message) for m in msgs_to_forward)
+                            if has_metadata:
+                                raise ValueError("Metadata tags present in vault messages; forcing upload fallback to strip tags.")
                             
-                            if not clean_caption and not file_arg:
-                                logger.info("Skipping vault release fallback send since the message is completely empty after cleaning.")
-                            else:
-                                await userbot.send_message(
-                                    entity=target_peer,
-                                    message=clean_caption,
-                                    file=file_arg,
-                                    reply_to=reply_header
-                                )
-                        finally:
-                            for path in downloaded_paths:
-                                if os.path.exists(path):
-                                    try: os.remove(path)
-                                    except Exception: pass
-                        
-                    success += len(msgs_to_forward)
+                            is_target_forum = False
+                            try:
+                                tgt_ent = await userbot.get_input_entity(int(target_id))
+                                is_target_forum = getattr(tgt_ent, 'forum', False) if hasattr(tgt_ent, 'forum') else False
+                            except Exception:
+                                pass
+
+                            await forward_natively(
+                                client=userbot,
+                                entity=int(target_id),
+                                messages=msgs_to_forward,
+                                from_peer=int(bot_id),
+                                top_msg_id=int(target_topic_id) if (is_target_forum and target_topic_id) else None
+                            )
+                        except Exception as fwd_err:
+                            logger.warning(f"Failed to forward natively in vault release: {fwd_err}. Falling back to clean upload.")
+                            
+                            media_files = []
+                            downloaded_paths = []
+                            for m in msgs_to_forward:
+                                if m.media:
+                                    try:
+                                        path = await userbot.download_media(m)
+                                        if path:
+                                            media_files.append(path)
+                                            downloaded_paths.append(path)
+                                    except Exception as dl_err:
+                                        logger.error(f"Failed to download media for vault release fallback: {dl_err}")
+                            
+                            try:
+                                file_arg = media_files if len(media_files) > 1 else (media_files[0] if media_files else None)
+                                if not file_arg and any(m.media for m in msgs_to_forward):
+                                    file_arg = [m.media for m in msgs_to_forward] if len(msgs_to_forward) > 1 else msgs_to_forward[0].media
+                                
+                                if not clean_caption and not file_arg:
+                                    logger.info("Skipping vault release fallback send since the message is completely empty after cleaning.")
+                                else:
+                                    await userbot.send_message(
+                                        entity=int(target_id),
+                                        message=clean_caption,
+                                        file=file_arg,
+                                        reply_to=int(target_topic_id) if target_topic_id else None 
+                                    )
+                            finally:
+                                for path in downloaded_paths:
+                                    if os.path.exists(path):
+                                        try: os.remove(path)
+                                        except Exception: pass
+                        success += len(msgs_to_forward)
+                    else:
+                        failed += len(group)
                 else:
                     failed += len(group)
             except Exception as e:
-                logger.error(f"Vault Release Group Array Exception: {e}")
+                logger.error(f"Vault Release group error: {e}")
                 failed += len(group)
 
             if (i + 1) % 5 == 0 or (i + 1) == total_groups:
-                try: 
-                    sender_bot.edit_message_text(f"📊 *Processing Status:* `{i+1}/{total_groups} Batches`\n✅ Success Count: `{success}`\n❌ Failed Count: `{failed}`", admin_chat_id, status_msg.message_id, reply_markup=stop_markup, parse_mode="Markdown")
-                except Exception: 
-                    pass
+                try: sender_bot.edit_message_text(f"📊 *Status:* `{i+1}/{total}`\n✅ Success: `{success}`\n❌ Failed: `{failed}`", admin_chat_id, status_msg.message_id, reply_markup=stop_markup, parse_mode="Markdown")
+                except Exception: pass
 
             await asyncio.sleep(interval)
             
-        sender_bot.send_message(admin_chat_id, f"✅ **Vault Release System Completed**\n\n📦 **Total Evaluated:** `{total}` entries\n🎉 **Successful:** `{success}`\n❌ **Failed:** `{failed}`", parse_mode="Markdown")
+        sender_bot.send_message(admin_chat_id, f"✅ **Vault Release Completed**\n\n📦 **Total Released:** `{total}` items\n\n🎉 **Successful:** `{success}`\n❌ **Failed:** `{total - success}`", parse_mode="Markdown")
     except Exception as e:
-        logger.error(f"Global Fallback Release Crash Exception: {e}")
-        sender_bot.send_message(admin_chat_id, f"❌ Engine Core Exception: {e}")
+        logger.error(f"Global Release Error: {e}")
+        sender_bot.send_message(admin_chat_id, f"❌ Engine Error: {e}")
     finally:
         running_tasks.pop(task_key, None)
 
@@ -5696,31 +5691,40 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     pass
                 await asyncio.sleep(1.0)
 
+        if running_tasks.get(task_key):
+            opts = collection_options.setdefault(task_key, {})
+            opts["status"] = "Completed"
+            opts["progress"] = 100
+            try:
+                bot.edit_message_text(
+                    get_collection_status_text(task_key, is_done=True),
+                    admin_chat_id,
+                    status_msg.message_id,
+                    reply_markup=get_collection_markup(pair_id),
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+                
+            curr_instant = opts.get("instant_release", False)
+            instant_filter = opts.get("instant_filter", "everything")
+            f_map = {"everything": "All Content", "media": "Media Only", "text": "Text Only"}
+            f_label = f" matching {f_map.get(instant_filter, 'All Content')} 🔄" if curr_instant else ""
+            sent_label = f"Sent to Target: `{sent_count}`{f_label}" if curr_instant else f"Sent to Target: `{sent_count} (Hold Mode)`"
+            bot.send_message(admin_chat_id, f"✅ Collection Done: `{s_title}`\nScanned: `{scanned}`\nCollected & Saved: `{collected}`\n{sent_label}")
+        else:
+            bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user.\nScanned: `{scanned}`\nCollected & Saved: `{collected}`")
+            
     except Exception as e:
-        logger.error(f"Error in collection task {task_key}: {e}")
-        try:
-            bot.send_message(admin_chat_id, f"❌ Error in collection: {e}")
-        except Exception:
-            pass
+        bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
     finally:
-        running_tasks[task_key] = False
-        opts = collection_options.setdefault(task_key, {})
-        opts["status"] = "Finished"
-        try:
-            bot.edit_message_text(
-                get_collection_status_text(task_key),
-                admin_chat_id,
-                status_msg.message_id,
-                reply_markup=get_collection_markup(pair_id),
-                parse_mode="HTML"
-            )
-        except Exception:
-            pass
+        running_tasks.pop(task_key, None)
+        collection_options.pop(task_key, None)
 
 async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, release_filter="everything"):
     is_ok, msg = await ensure_userbot()
     if not is_ok:
-        bot.send_message(admin_chat_id, f"❌ Userbot connection issue: {msg}")
+        bot.send_message(admin_chat_id, f"❌ Userbot error: {msg}")
         return
 
     task_key = f"rel_{added_by}_{pair_id}" if added_by else f"rel_{pair_id}"
@@ -5741,255 +5745,354 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
         try:
             source_chat = await resolve_target_id(userbot, sid_ref)
             source_accessible = True
-        except Exception:
-            logger.warning(f"Source chat {sid_ref} missing network wire visibility. Using storage fallback tracks.")
+        except Exception as se:
+            logger.warning(f"Source chat {sid_ref} is not accessible: {se}. Releasing via vault fallback.")
             
-        target_chat = await resolve_target_id(userbot, tid_ref)
-        is_target_forum = getattr(target_chat, 'forum', False)
+        try:
+            target_chat = await resolve_target_id(userbot, tid_ref)
+        except Exception as e:
+            bot.send_message(admin_chat_id, f"❌ Connection Error: {e}\n\nMake sure the bot is a member of the target chat.")
+            return
 
+        # Map added_by filter for query backward compatibility
         media_filter = ""
         category_name = "Collected Items"
-        if added_by == "monitor": media_filter = "AND COALESCE(added_by, 'monitor') = 'monitor'"
-        elif added_by == "scraper": media_filter = "AND COALESCE(added_by, 'monitor') = 'scraper'"
-        elif added_by == "collection": media_filter = "AND COALESCE(added_by, 'monitor') = 'collection'"
+        if added_by == "monitor":
+            media_filter = "AND COALESCE(added_by, 'monitor') = 'monitor'"
+            category_name = "Monitor"
+        elif added_by == "scraper":
+            media_filter = "AND COALESCE(added_by, 'monitor') = 'scraper'"
+            category_name = "History Scraper"
+        elif added_by == "collection":
+            media_filter = "AND COALESCE(added_by, 'monitor') = 'collection'"
+            category_name = "Collect Now"
 
         with db_conn() as conn:
             c = conn.cursor()
             p = get_placeholder()
-            c.execute(f"SELECT id, source_message_id, media_type, caption FROM collected_media WHERE pair_id = {p} AND released = 0 {media_filter} ORDER BY source_message_id ASC", (pair_id,))
+            c.execute(f"SELECT id, source_message_id FROM collected_media WHERE pair_id = {p} AND released = 0 {media_filter}", (pair_id,))
             items = c.fetchall()
         
         if not items:
-            bot.send_message(admin_chat_id, f"No pending elements matching categorization inside {category_name}.")
+            bot.send_message(admin_chat_id, f"No pending items from {category_name} to release.")
             return
 
-        sent_count = 0
-        markup = InlineKeyboardMarkup().add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{added_by}_{pair_id}" if added_by else f"pair_stop_task_rel_{pair_id}"))
-        status_msg = bot.send_message(admin_chat_id, f"🚀 Deploying Release Cluster across `{len(items)}` database objects...", reply_markup=markup)
+        sent = 0
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🛑 Stop Release", callback_data=f"pair_stop_task_rel_{added_by}_{pair_id}" if added_by else f"pair_stop_task_rel_{pair_id}"))
         
-        assembled_batches = []
-        processed_message_ids = set()
+        f_names = {"everything": "All Content 🔄", "media": "Media Only 🖼️", "text": "Text Only 📝"}
+        display_filter = f_names.get(release_filter, "All Content 🔄")
+        status_msg = bot.send_message(admin_chat_id, f"🚀 Releasing `{len(items)}` items from {category_name}...\n🎯 Filter: `{display_filter}`", reply_markup=markup)
         
-        for row_id, smid, m_type, cap in items:
-            if smid in processed_message_ids: continue
-            
-            msg_object = None
-            if source_accessible and source_chat:
-                try:
-                    msg_object = await userbot.get_messages(source_chat, ids=smid)
-                except Exception: pass
-                
-            if not msg_object:
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    p = get_placeholder()
-                    c.execute(f"SELECT bot_id, log_msg_id, grouped_id FROM log_media WHERE source_chat_id = {p} AND source_msg_id = {p}", (sid_ref, smid))
-                    v_row = c.fetchone()
-                if v_row:
-                    v_bot, v_msg, v_gid = v_row
-                    try:
-                        v_chat = await resolve_target_id(userbot, v_bot)
-                        msg_object = await userbot.get_messages(v_chat, ids=v_msg)
-                        if msg_object:
-                            msg_object._source_msg_id = smid
-                            msg_object._mapped_grouped_id = v_gid
-                            msg_object._vault_bot_id = v_bot
-                    except Exception: pass
-            
-            if msg_object:
-                assembled_batches.append((row_id, msg_object))
-                processed_message_ids.add(smid)
-            else:
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    p = get_placeholder()
-                    c.execute(f"UPDATE collected_media SET released = 2 WHERE id = {p}", (row_id,))
-                    conn.commit()
-
-        final_processing_sequence = []
-        temp_album = []
-        last_album_id = None
-        
-        for r_id, msg in assembled_batches:
-            current_gid = getattr(msg, '_mapped_grouped_id', msg.grouped_id)
-            if current_gid:
-                if last_album_id and current_gid == last_album_id:
-                    temp_album.append((r_id, msg))
-                else:
-                    if temp_album: final_processing_sequence.append(temp_album)
-                    temp_album = [(r_id, msg)]
-                    last_album_id = current_gid
-            else:
-                if temp_album:
-                    final_processing_sequence.append(temp_album)
-                    temp_album = []
-                last_album_id = None
-                final_processing_sequence.append([(r_id, msg)])
-        if temp_album:
-            final_processing_sequence.append(temp_album)
-
-        for batch in final_processing_sequence:
+        idx = 0
+        while idx < len(items):
             if not running_tasks.get(task_key): break
+            row_id, smid = items[idx]
             
-            valid_batch_targets = []
-            row_ids_to_update = []
-            
-            for r_id, msg in batch:
-                has_media = bool(msg.media)
-                if release_filter == "media" and not has_media: continue
-                if release_filter == "text" and has_media: continue
-                valid_batch_targets.append(msg)
-                row_ids_to_update.append(r_id)
-                
-            if not valid_batch_targets: continue
-            
-            first_msg = valid_batch_targets[0]
-            orig_source_id = getattr(first_msg, '_source_msg_id', first_msg.id)
-            
-            for m in valid_batch_targets:
-                if m.message:
-                    m.message = re.sub(r"SID:\s*-?\d+\s*\|\s*MID:\s*\d+\n?", "", m.message).strip()
-
-            batch_has_media = any(m.media for m in valid_batch_targets)
-            batch_text = next((m.message for m in valid_batch_targets if m.message), "")
-            if not batch_text and not batch_has_media:
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    p = get_placeholder()
-                    for r_id in row_ids_to_update:
-                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (r_id,))
-                    conn.commit()
-                continue
-
-            target_topic_anchor = t_topic
-            if is_target_forum:
-                s_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or (first_msg.reply_to.reply_to_msg_id if first_msg.reply_to else None)
-                if not s_top and getattr(first_msg, 'forum_topic', False): s_top = first_msg.id
-                if s_top:
-                    mapped_topic = get_topic_mapping(sid_ref, s_top, tid_ref)
-                    if mapped_topic:
-                        target_topic_anchor = mapped_topic
-                    else:
-                        forum_obj = getattr(first_msg.reply_to, "forum_topic", None)
-                        src_title = getattr(forum_obj, "title", "Archived Channel Stream")
-                        target_topic_anchor = await get_or_create_target_topic(userbot, tid_ref, src_title, sid_ref, s_top)
-
-            # Reply Header Matching Matrix
-            reply_to_val = None
-            if first_msg.reply_to_msg_id:
-                reply_to_val = get_message_mapping(sid_ref, first_msg.reply_to_msg_id, tid_ref)
-                
-            final_reply_target = reply_to_val if reply_to_val else (target_topic_anchor if is_target_forum else None)
-
-            # Execution Engine Delivery Call
-            sent_msg = None
-            downloaded_paths = []
-            
+            advance = True
             try:
-                # Attempt native forward if source chat is accessible and not restricted
-                is_source_restricted = False
+                msg = None
+                from_vault = False
+                vault_bot_id = None
+                
                 if source_accessible and source_chat:
-                    is_source_restricted = getattr(source_chat, 'noforwards', False)
-                
-                has_metadata = any(m.message and ("SID:" in m.message or "MID:" in m.message) for m in valid_batch_targets)
-                
-                if source_accessible and not is_source_restricted and not has_metadata:
                     try:
-                        sent_msg = await forward_natively(
-                            client=userbot,
-                            entity=target_chat,
-                            messages=valid_batch_targets,
-                            from_peer=sid_ref,
-                            top_msg_id=int(final_reply_target) if (is_target_forum and final_reply_target) else None
-                        )
-                    except Exception as fwd_err:
-                        logger.warning(f"Native forward in run_release failed: {fwd_err}. Falling back to send_message upload...")
+                        msg = await userbot.get_messages(source_chat, ids=smid)
+                    except Exception as ge:
+                        logger.warning(f"Could not get message {smid} from source: {ge}. Trying vault.")
                 
-                if not sent_msg:
-                    # Pre-download album files to local temp paths during the fallback upload path to ensure Telethon groups them correctly
-                    file_arg = None
-                    if len(valid_batch_targets) > 1:
-                        logger.info("Downloading album media to local temp files for release fallback...")
-                        media_files = []
-                        for m in valid_batch_targets:
-                            if m.media:
-                                try:
-                                    path = await userbot.download_media(m)
-                                    if path:
-                                        media_files.append(path)
-                                        downloaded_paths.append(path)
-                                except Exception as dl_err:
-                                    logger.error(f"Failed to download media for release album: {dl_err}")
-                        file_arg = media_files if media_files else None
-                    else:
-                        file_arg = first_msg.media
+                if not msg:
+                    # Try to fetch from vault bot mapping
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"SELECT bot_id, log_msg_id FROM log_media WHERE source_chat_id = {p} AND source_msg_id = {p}", (sid_ref, smid))
+                        vault_row = c.fetchone()
                     
-                    if len(valid_batch_targets) == 1:
-                        sent_msg = await userbot.send_message(
-                            entity=target_chat,
-                            message=first_msg.message or "",
-                            file=file_arg,
-                            reply_to=int(final_reply_target) if final_reply_target else None
-                        )
+                    if vault_row:
+                        vault_bot_id, vault_msg_id = vault_row
+                        try:
+                            vault_chat = await resolve_target_id(userbot, vault_bot_id)
+                            msg = await userbot.get_messages(vault_chat, ids=vault_msg_id)
+                            if msg:
+                                from_vault = True
+                        except Exception as ve:
+                            logger.error(f"Failed to fetch message {smid} from vault bot {vault_bot_id}: {ve}")
+                
+                if not msg:
+                    # Message is completely inaccessible, mark as skipped so we don't loop
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"UPDATE collected_media SET released = 2 WHERE id = {p}", (row_id,))
+                        conn.commit()
+                    continue
+
+                # --- CONTENT FILTERING ---
+                cf = cf or "everything"
+                if cf == "media" and not msg.media:
+                    # Mark as released so we don't try again
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                        conn.commit()
+                    continue
+                if cf == "text" and msg.media:
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                        conn.commit()
+                    continue
+
+                # --- DYNAMIC RELEASE FILTERING ---
+                # Check message against dynamic release filter: if it doesn't match, we skip
+                # sending but keep it in the database as unreleased (released = 0) for future release runs.
+                if release_filter == "media" and not msg.media:
+                    continue
+                if release_filter == "text" and msg.media:
+                    continue
+
+                # FIX: Strip out metadata text blocks safely before presenting to destination chat
+                if msg.message:
+                    msg.message = re.sub(r"SID:\s*-?\d+\s*\|\s*MID:\s*\d+\n?", "", msg.message).strip()
+
+                # Prevent empty message exception if both text and media are empty after cleaning
+                if not msg.message and not msg.media:
+                    logger.info(f"Skipping release of message {row_id} as it is empty after cleaning.")
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                        conn.commit()
+                    continue
+
+                target_topic_anchor = t_topic
+                
+                # Determine if BOTH chats are forums to automatically mirror topics
+                auto_mirror = False
+                is_source_forum = getattr(source_chat, 'forum', False) if source_accessible else True # Try mapping if target is forum
+                if is_source_forum and getattr(target_chat, 'forum', False):
+                    auto_mirror = True
+
+                # Handle Mirroring ID detection for release
+                if auto_mirror:
+                    s_top = None
+                    if from_vault and vault_bot_id:
+                        v_top = getattr(msg.reply_to, 'reply_to_top_id', None) or (msg.reply_to.reply_to_msg_id if msg.reply_to else None)
+                        if v_top:
+                            with db_conn() as conn:
+                                c = conn.cursor()
+                                p = get_placeholder()
+                                c.execute(f"SELECT source_topic_id FROM topic_mappings WHERE source_chat_id = {p} AND target_topic_id = {p} AND target_chat_id = {p}", (sid_ref, v_top, vault_bot_id))
+                                row_t = c.fetchone()
+                                if row_t:
+                                    s_top = row_t[0]
                     else:
-                        sent_msg = await userbot.send_message(
-                            entity=target_chat,
-                            message=batch_text,
-                            file=file_arg,
-                            reply_to=int(final_reply_target) if final_reply_target else None
-                        )
-            except Exception as e:
-                logger.error(f"Failsafe Delivery Routine Activated for Batch Cluster: {e}")
-                
-                # Check if it was protected/reference error
-                err_msg = str(e).lower()
-                is_protected_error = any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer"])
-                
-                # Download single protected media if needed
-                if is_protected_error and len(valid_batch_targets) == 1 and not downloaded_paths and first_msg.media:
-                    logger.info("🛡️ RELEASE: Protected single media detected. Attempting download & upload fallback...")
-                    try:
-                        path = await userbot.download_media(first_msg)
-                        if path:
-                            file_arg = path
-                            downloaded_paths.append(path)
-                    except Exception as dl_err:
-                        logger.error(f"Failed to download single protected media: {dl_err}")
-                
-                # Secondary final structural fallback attempt with stripped headers
+                        s_top = getattr(msg.reply_to, 'reply_to_top_id', None) or (msg.reply_to.reply_to_msg_id if msg.reply_to else None)
+                        if not s_top and getattr(msg, 'forum_topic', False):
+                            s_top = msg.id
+                        if not s_top and msg.reply_to_msg_id:
+                            s_top = msg.reply_to_msg_id
+                    
+                    if s_top:
+                        # Priority check database mapping
+                        mapped = get_topic_mapping(sid_ref, s_top, tid_ref)
+                        if mapped:
+                            target_topic_anchor = mapped
+                        elif source_accessible:
+                            # Search for title/icon in source chat to mirror dynamically
+                            forum = getattr(msg.reply_to, "forum_topic", None) if msg.reply_to else None
+                            src_title = getattr(forum, "title", None)
+                            src_icon = getattr(forum, "icon_emoji_id", None)
+                            if not src_title:
+                                try:
+                                    async with userbot_lock:
+                                        res = await userbot(functions.messages.GetForumTopicsRequest(
+                                            peer=source_chat, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                        ))
+                                    for t in res.topics:
+                                        if t.id == s_top:
+                                            src_title = t.title
+                                            src_icon = getattr(t, "icon_emoji_id", None)
+                                            break
+                                except Exception as e:
+                                    logger.error(f"Failed to fetch source forum topics in release: {e}")
+                            
+                            if src_title:
+                                target_topic_anchor = await get_or_create_target_topic(
+                                    userbot, tid_ref, src_title, sid_ref, s_top, icon_emoji_id=src_icon
+                                )
+
+                # Resolve reply mapping
+                reply_to_val = None
+                src_reply_msg_id = None
+                if from_vault and vault_bot_id and getattr(msg, "reply_to_msg_id", None):
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"SELECT source_msg_id FROM log_media WHERE bot_id = {p} AND log_msg_id = {p}", (vault_bot_id, msg.reply_to_msg_id))
+                        row_r = c.fetchone()
+                        if row_r:
+                            src_reply_msg_id = row_r[0]
+                elif not from_vault and getattr(msg, "reply_to_msg_id", None):
+                    src_reply_msg_id = msg.reply_to_msg_id
+                    
+                if src_reply_msg_id:
+                    reply_to_val = get_message_mapping(sid_ref, src_reply_msg_id, tid_ref)
+
+                # Construct Topic Header
+                # If it's a specific reply, use it. Otherwise, use the Topic Header ID.
+                final_reply_target = reply_to_val if reply_to_val else target_topic_anchor
+
+                sent_msg = None
                 try:
                     sent_msg = await userbot.send_message(
                         entity=target_chat,
-                        message=batch_text if len(valid_batch_targets) > 1 else (first_msg.message or ""),
-                        file=file_arg,
-                        reply_to=int(target_topic_anchor) if (is_target_forum and target_topic_anchor) else None
+                        message=msg.message or "",
+                        file=msg.media,
+                        reply_to=int(final_reply_target) if final_reply_target else None
                     )
-                except Exception as critical_drop:
-                    logger.critical(f"Asset block dropped entirely from structural deployment sequence: {critical_drop}")
-            finally:
-                for path in downloaded_paths:
-                    if os.path.exists(path):
-                        try: os.remove(path)
-                        except Exception: pass
-
-            if sent_msg:
-                final_sent_id = sent_msg[0].id if isinstance(sent_msg, list) else sent_msg.id
-                save_message_mapping(sid_ref, orig_source_id, tid_ref, final_sent_id)
+                except Exception as e:
+                    # If we had a reply target, attempt to fallback/downgrade reply first
+                    if final_reply_target is not None:
+                        is_forum = getattr(target_chat, 'forum', False) if not isinstance(target_chat, int) else False
+                        next_reply = None
+                        if is_forum and target_topic_anchor and int(final_reply_target) != int(target_topic_anchor):
+                            next_reply = int(target_topic_anchor)
+                        
+                        logger.warning(f"⚠️ RELEASE: Failed to send with reply_to={final_reply_target} ({e}). Retrying with reply_to={next_reply}...")
+                        try:
+                            sent_msg = await userbot.send_message(
+                                entity=target_chat,
+                                message=msg.message or "",
+                                file=msg.media,
+                                reply_to=next_reply
+                            )
+                        except Exception as e2:
+                            if next_reply is not None:
+                                logger.warning(f"⚠️ RELEASE: Failed to send with reply_to={next_reply} ({e2}). Retrying with reply_to=None...")
+                                try:
+                                    sent_msg = await userbot.send_message(
+                                        entity=target_chat,
+                                        message=msg.message or "",
+                                        file=msg.media,
+                                        reply_to=None
+                                    )
+                                except Exception as e3:
+                                    e = e3
+                            else:
+                                e = e2
+                    
+                    # If still failed, check if we need to do fallback download & upload
+                    if not sent_msg:
+                        err_msg = str(e).lower()
+                        if any(x in err_msg for x in ["protected", "forward", "restricted", "noforwards", "forbidden", "reference", "peer"]):
+                            logger.info("🛡️ RELEASE: Protected or invalid peer media detected. Attempting download & upload fallback...")
+                            local_file = None
+                            try:
+                                local_file = await userbot.download_media(msg)
+                            except errors.FloodWaitError as fwe:
+                                raise fwe
+                            except Exception as de:
+                                logger.error(f"Failed to download media in release fallback: {de}")
+                            if local_file:
+                                try:
+                                    sent_msg = await userbot.send_message(
+                                        entity=target_chat,
+                                        message=msg.message or "",
+                                        file=local_file,
+                                        reply_to=int(final_reply_target) if final_reply_target else None
+                                    )
+                                except Exception as fe:
+                                    # Downgrade in fallback as well
+                                    if final_reply_target is not None:
+                                        is_forum = getattr(target_chat, 'forum', False) if not isinstance(target_chat, int) else False
+                                        next_reply = None
+                                        if is_forum and target_topic_anchor and int(final_reply_target) != int(target_topic_anchor):
+                                            next_reply = int(target_topic_anchor)
+                                        
+                                        logger.warning(f"⚠️ RELEASE FALLBACK: Failed to send with reply_to={final_reply_target} ({fe}). Retrying with reply_to={next_reply}...")
+                                        try:
+                                            sent_msg = await userbot.send_message(
+                                                entity=target_chat,
+                                                message=msg.message or "",
+                                                file=local_file,
+                                                reply_to=next_reply
+                                            )
+                                        except Exception as fe2:
+                                            if next_reply is not None:
+                                                logger.warning(f"⚠️ RELEASE FALLBACK: Failed to send with reply_to={next_reply} ({fe2}). Retrying with reply_to=None...")
+                                                try:
+                                                    sent_msg = await userbot.send_message(
+                                                        entity=target_chat,
+                                                        message=msg.message or "",
+                                                        file=local_file,
+                                                        reply_to=None
+                                                    )
+                                                except Exception as fe3:
+                                                    raise fe3
+                                            else:
+                                                raise fe2
+                                    else:
+                                        raise fe
+                                finally:
+                                    if os.path.exists(local_file):
+                                        os.remove(local_file)
+                            else:
+                                raise e
+                        else:
+                            raise e
                 
-                with db_conn() as conn:
-                    c = conn.cursor()
-                    p = get_placeholder()
-                    for r_id in row_ids_to_update:
-                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (r_id,))
-                    conn.commit()
-                sent_count += len(valid_batch_targets)
+                if sent_msg:
+                    save_message_mapping(sid_ref, msg.id, tid_ref, sent_msg.id)
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                        conn.commit()
+                sent += 1
+                if sent % 5 == 0:
+                    try: bot.edit_message_text(f"🚀 Releasing `{s_title}` ({category_name})...\n🎯 Filter: `{display_filter}`\nSent: `{sent}/{len(items)}`", admin_chat_id, status_msg.message_id, reply_markup=markup)
+                    except Exception: pass
+                await asyncio.sleep(interval)
+            except errors.FloodWaitError as fwe:
+                logger.warning(f"⏳ RELEASE FLOOD: A wait of {fwe.seconds} seconds is required. Sleeping...")
+                try:
+                    bot.edit_message_text(
+                        f"⏳ *Release Rate-Limited*\n\nWaiting `{fwe.seconds}` seconds before retrying message ID `{smid}`...",
+                        admin_chat_id,
+                        status_msg.message_id,
+                        reply_markup=markup
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(fwe.seconds)
+                advance = False
+            except Exception as e:
+                err_msg = str(e).lower()
+                if any(x in err_msg for x in ["private", "permission", "ban", "forbidden", "access"]):
+                    logger.warning(f"⚠️ RELEASE: Message ID {smid} is inaccessible ({e}). Marking as failed/skipped.")
+                    try:
+                        with db_conn() as conn:
+                            c = conn.cursor()
+                            p = get_placeholder()
+                            c.execute(f"UPDATE collected_media SET released = 2 WHERE id = {p}", (row_id,))
+                            conn.commit()
+                    except Exception as db_err:
+                        logger.error(f"Failed to update inaccessible status in DB: {db_err}")
+                logger.error(f"Release error: {e}")
+                await asyncio.sleep(0.05)
+            finally:
+                if advance:
+                    idx += 1
 
-            await asyncio.sleep(interval)
-            
-        bot.send_message(admin_chat_id, f"✅ **Release Complete:** Successfully distributed `{sent_count}` entries matching filters via structural engine.")
+        bot.send_message(admin_chat_id, f"✅ Release Complete: Sent `{sent}` items from {category_name} matching `{display_filter}`.")
     except Exception as e:
-        logger.error(f"Global Core Exception Encountered Inside Release Engine Loop: {e}")
-        bot.send_message(admin_chat_id, f"❌ Release Core Crash Event: {e}")
+        logger.error(f"Global Release Error: {e}")
+        bot.send_message(admin_chat_id, f"❌ Release Crashed: {e}")
     finally:
         running_tasks.pop(task_key, None)
 
