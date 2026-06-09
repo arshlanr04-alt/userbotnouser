@@ -5380,6 +5380,10 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                         opts.update({
                             "sent_count": sent_count
                         })
+                        
+                    if curr_instant and matching_batch:
+                        # Gradual release sleep delay to avoid bulk flood
+                        await asyncio.sleep(1.2)
 
             if to_fetch_remain is not None:
                 to_fetch_remain -= len(chunk)
