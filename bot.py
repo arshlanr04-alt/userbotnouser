@@ -802,6 +802,58 @@ def get_topic_mapping(s_chat, s_topic, t_chat):
         row = c.fetchone()
         return row[0] if row else None
 
+
+async def forward_natively(client, entity, messages, from_peer, top_msg_id=None):
+    """
+    Safely forwards messages natively.
+    If top_msg_id is provided, it uses ForwardMessagesRequest with top_msg_id.
+    Otherwise, it uses client.forward_messages.
+    Returns the sent message object or a list of sent message objects (matching input structure).
+    """
+    import random
+    if not messages:
+        return []
+    
+    is_single = not isinstance(messages, list)
+    msg_list = [messages] if is_single else messages
+
+    if top_msg_id is not None:
+        try:
+            to_peer = await client.get_input_entity(entity)
+            from_peer_input = await client.get_input_entity(from_peer)
+            
+            msg_ids = [m.id if hasattr(m, 'id') else int(m) for m in msg_list]
+            random_ids = [random.randint(-2**63, 2**63 - 1) for _ in msg_ids]
+            
+            req = functions.messages.ForwardMessagesRequest(
+                from_peer=from_peer_input,
+                id=msg_ids,
+                to_peer=to_peer,
+                random_id=random_ids,
+                top_msg_id=int(top_msg_id)
+            )
+            result = await client(req)
+            
+            sent_msgs = []
+            if isinstance(result, types.Updates):
+                for update in result.updates:
+                    if isinstance(update, (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
+                        sent_msgs.append(update.message)
+            
+            if is_single:
+                return sent_msgs[0] if sent_msgs else None
+            return sent_msgs
+        except Exception as e:
+            logger.error(f"Error in ForwardMessagesRequest with top_msg_id {top_msg_id}: {e}")
+            raise e
+    else:
+        return await client.forward_messages(
+            entity=entity,
+            messages=messages,
+            from_peer=from_peer
+        )
+
+
 def save_message_mapping(s_chat, s_msg, t_chat, t_msg):
     with db_conn() as conn:
         c = conn.cursor()
@@ -1083,19 +1135,55 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                             has_metadata = any(m.message and ("SID:" in m.message or "MID:" in m.message) for m in msgs_to_forward)
                             if has_metadata:
                                 raise ValueError("Metadata tags present in vault messages; forcing upload fallback to strip tags.")
-                            await userbot.forward_messages(
+                            
+                            is_target_forum = False
+                            try:
+                                tgt_ent = await userbot.get_input_entity(int(target_id))
+                                is_target_forum = getattr(tgt_ent, 'forum', False) if hasattr(tgt_ent, 'forum') else False
+                            except Exception:
+                                pass
+
+                            await forward_natively(
+                                client=userbot,
                                 entity=int(target_id),
                                 messages=msgs_to_forward,
-                                reply_to=target_topic_id if target_topic_id else None
+                                from_peer=int(bot_id),
+                                top_msg_id=int(target_topic_id) if (is_target_forum and target_topic_id) else None
                             )
                         except Exception as fwd_err:
                             logger.warning(f"Failed to forward natively in vault release: {fwd_err}. Falling back to clean upload.")
-                            await userbot.send_message(
-                                entity=int(target_id),
-                                message=clean_caption,
-                                file=[m.media for m in msgs_to_forward] if len(msgs_to_forward) > 1 else msgs_to_forward[0].media,
-                                reply_to=target_topic_id if target_topic_id else None 
-                            )
+                            
+                            media_files = []
+                            downloaded_paths = []
+                            for m in msgs_to_forward:
+                                if m.media:
+                                    try:
+                                        path = await userbot.download_media(m)
+                                        if path:
+                                            media_files.append(path)
+                                            downloaded_paths.append(path)
+                                    except Exception as dl_err:
+                                        logger.error(f"Failed to download media for vault release fallback: {dl_err}")
+                            
+                            try:
+                                file_arg = media_files if len(media_files) > 1 else (media_files[0] if media_files else None)
+                                if not file_arg and any(m.media for m in msgs_to_forward):
+                                    file_arg = [m.media for m in msgs_to_forward] if len(msgs_to_forward) > 1 else msgs_to_forward[0].media
+                                
+                                if not clean_caption and not file_arg:
+                                    logger.info("Skipping vault release fallback send since the message is completely empty after cleaning.")
+                                else:
+                                    await userbot.send_message(
+                                        entity=int(target_id),
+                                        message=clean_caption,
+                                        file=file_arg,
+                                        reply_to=int(target_topic_id) if target_topic_id else None 
+                                    )
+                            finally:
+                                for path in downloaded_paths:
+                                    if os.path.exists(path):
+                                        try: os.remove(path)
+                                        except Exception: pass
                         success += len(msgs_to_forward)
                     else:
                         failed += len(group)
@@ -1889,30 +1977,48 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
                             client, log_chat_id, src_title, source_chat_id, s_top, icon_emoji_id=src_icon
                         )
 
+        vaulted_result = None
+        downloaded_paths = []
         try:
             if not is_restricted:
                 try:
-                    vaulted_result = await client.forward_messages(
+                    # Check if target is a forum
+                    is_target_forum = getattr(target_peer, 'forum', False) if not isinstance(target_peer, int) else False
+                    vaulted_result = await forward_natively(
+                        client=client,
                         entity=target_peer,
                         messages=messages,
                         from_peer=source_chat_id,
-                        reply_to=int(dest_topic_id) if dest_topic_id else None
+                        top_msg_id=int(dest_topic_id) if (is_target_forum and dest_topic_id) else None
                     )
                 except Exception as fwd_err:
-                    logger.warning(f"Native forward to vault failed: {fwd_err}. Falling back to send_message.")
+                    logger.warning(f"Native forward to vault failed: {fwd_err}. Falling back to send_message with download/upload.")
+
+            if not vaulted_result:
+                # Fallback: download and upload
+                media_files = []
+                for m in messages:
+                    if m.media:
+                        try:
+                            path = await client.download_media(m)
+                            if path:
+                                media_files.append(path)
+                                downloaded_paths.append(path)
+                        except Exception as dl_err:
+                            logger.error(f"Failed to download media for vault upload: {dl_err}")
+                
+                file_arg = media_files if len(media_files) > 1 else (media_files[0] if media_files else None)
+                
+                # Check if message is empty (no text and no media)
+                if not caption_text and not file_arg:
+                    logger.info("Skipping vaulting since the message is empty after cleaning.")
+                else:
                     vaulted_result = await client.send_message(
                         entity=target_peer,
-                        file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
+                        file=file_arg,
                         message=caption_text,
                         reply_to=int(dest_topic_id) if dest_topic_id else None
                     )
-            else:
-                vaulted_result = await client.send_message(
-                    entity=target_peer,
-                    file=[m.media for m in messages] if len(messages) > 1 else messages[0].media,
-                    message=caption_text,
-                    reply_to=int(dest_topic_id) if dest_topic_id else None
-                )
             await asyncio.sleep(2)
         except errors.FloodWaitError as fwe:
             logger.warning(f"⏳ VAULT FLOOD: Waiting {fwe.seconds}s...")
@@ -1923,6 +2029,11 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
                 logger.warning(f"🛡️ VAULT: Protected media detected but could not forward to vault bot. Vaulting skipped.")
             else:
                 raise e
+        finally:
+            for path in downloaded_paths:
+                if os.path.exists(path):
+                    try: os.remove(path)
+                    except Exception: pass
             
         if vaulted_result:
             # vaulted_result is a list if it was an album, or a single Message object
@@ -2081,16 +2192,19 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
             
         file_to_send = files_to_send if len(files_to_send) > 1 else (files_to_send[0] if files_to_send else None)
 
+        sent = None
+        
         # FIX: Attempt native forward first to preserve the "Forwarded From" tag layout if not restricted
         try:
             # Only do native clone if not running an absolute fallback download scheme and no metadata tags present
             has_metadata = any(m.message and ("SID:" in m.message or "MID:" in m.message) for m in messages)
             if not pre_downloaded and not has_metadata:
-                sent = await client.forward_messages(
+                sent = await forward_natively(
+                    client=client,
                     entity=target_entity,
                     messages=messages,
                     from_peer=int(sid),
-                    reply_to=reply_header
+                    top_msg_id=int(dest_topic_id) if (is_forum and dest_topic_id) else None
                 )
                 if sent:
                     if isinstance(sent, list) and len(sent) == len(messages):
@@ -2103,6 +2217,23 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                     return
         except Exception as native_err:
             logger.warning(f"Native forward mirroring failed: {native_err}. Utilizing file fallback upload style...")
+
+        # If native forward was skipped or failed, and it is an album that is not pre_downloaded, download it now
+        if not sent and len(files_to_send) > 1 and not pre_downloaded:
+            logger.info("Downloading album media to local temp files for upload fallback...")
+            for m in files_to_send:
+                try:
+                    path = await client.download_media(m)
+                    if path:
+                        downloaded_files.append(path)
+                except Exception as de:
+                    logger.error(f"Album media download failed: {de}")
+            file_to_send = downloaded_files
+
+        # Check if the message is completely empty (no text and no file/media)
+        if not album_text and not file_to_send:
+            logger.info("Skipping sending in mirror since the message is completely empty after cleaning.")
+            return
         
         for attempt in range(3):
             try:
@@ -5727,6 +5858,16 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                 # FIX: Strip out metadata text blocks safely before presenting to destination chat
                 if msg.message:
                     msg.message = re.sub(r"SID:\s*-?\d+\s*\|\s*MID:\s*\d+\n?", "", msg.message).strip()
+
+                # Prevent empty message exception if both text and media are empty after cleaning
+                if not msg.message and not msg.media:
+                    logger.info(f"Skipping release of message {row_id} as it is empty after cleaning.")
+                    with db_conn() as conn:
+                        c = conn.cursor()
+                        p = get_placeholder()
+                        c.execute(f"UPDATE collected_media SET released = 1 WHERE id = {p}", (row_id,))
+                        conn.commit()
+                    continue
 
                 target_topic_anchor = t_topic
                 
