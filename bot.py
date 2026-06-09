@@ -1838,7 +1838,9 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
         # RESOLVE ENTITY
         target_peer = await resolve_target_id(client, log_chat_id)
 
-        caption_text = first_msg.message or ""
+        # Metadata for Log Bot extraction (only on the first message of album if multiple)
+        metadata = f"SID: {source_chat_id} | MID: {first_msg.id}\n"
+        caption_text = metadata + (first_msg.message or "")
         
         is_restricted = False
         auto_mirror = False
@@ -2226,10 +2228,6 @@ async def process_automation_pipeline(client, messages, source_chat_id):
     pairs = get_target_pairs()
     if not messages: 
         return
-    # Filter out empty/service messages
-    messages = [msg for msg in messages if (msg.message or msg.media) and getattr(msg, 'action', None) is None]
-    if not messages:
-        return
     first_msg = messages[0]
     
     # 1. Topic Identification Routing
@@ -2411,7 +2409,8 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                         if files_to_vault:
                             file_payload = files_to_vault if len(files_to_vault) > 1 else files_to_vault[0]
                             for token, username, bot_id in get_log_bots():
-                                caption_text = first_msg.message or ""
+                                metadata = f"SID: {source_chat_id} | MID: {first_msg.id}\n"
+                                caption_text = metadata + (first_msg.message or "")
                                 try:
                                     vaulted_result = await client.send_message(
                                         entity=int(bot_id),
@@ -4709,11 +4708,6 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
             for m in chunk:
                 scanned += 1
                 
-                if not m.message and not m.media:
-                    continue
-                if getattr(m, 'action', None) is not None:
-                    continue
-                
                 if start_date and m.date < start_date:
                     continue
                 if end_date and m.date > end_date:
@@ -4938,7 +4932,8 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                         if files_to_vault:
                             file_payload = files_to_vault if len(files_to_vault) > 1 else files_to_vault[0]
                             for token, username, bot_id in get_log_bots():
-                                caption_text = batch[0].message or ""
+                                metadata = f"SID: {sid} | MID: {batch[0].id}\n"
+                                caption_text = metadata + (batch[0].message or "")
                                 try:
                                     async with userbot_lock:
                                         vaulted_result = await userbot.send_message(
@@ -5184,13 +5179,6 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 progress = int((scanned / total_to_fetch) * 100)
                 if progress > 100: progress = 100
                 
-                if not m.message and not m.media:
-                    opts.update({"scanned": scanned, "progress": progress})
-                    continue
-                if getattr(m, 'action', None) is not None:
-                    opts.update({"scanned": scanned, "progress": progress})
-                    continue
-                
                 sender_id = m.sender_id
                 sender_username = getattr(m.sender, 'username', None)
                 if is_user_banned(sender_id, sender_username):
@@ -5435,7 +5423,8 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                 if files_to_vault or not any(m.media for m in batch):
                                     file_payload = files_to_vault if len(files_to_vault) > 1 else (files_to_vault[0] if files_to_vault else None)
                                     for token, username, bot_id in get_log_bots():
-                                        caption_text = batch[0].message or ""
+                                        metadata = f"SID: {sid} | MID: {batch[0].id}\n"
+                                        caption_text = metadata + (batch[0].message or "")
                                         
                                         # Resolve vault topic mirroring
                                         vault_topic_id = None
@@ -6255,11 +6244,6 @@ class LogBotManager:
                             sid = int(parts[0].replace("SID:", "").strip())
                             mid = int(parts[1].split("\n")[0].replace("MID:", "").strip())
                             caption = caption.split("\n", 1)[1] if "\n" in caption else ""
-                        except: pass
-                    elif message.forward_from_chat:
-                        try:
-                            sid = message.forward_from_chat.id
-                            mid = message.forward_from_message_id or 0
                         except: pass
                     
                     # Log Bot API also has media_group_id
