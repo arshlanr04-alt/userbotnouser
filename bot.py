@@ -4625,7 +4625,8 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     target_chat,
                     limit=chunk_size,
                     offset_id=offset_id,
-                    reply_to=target_topic
+                    reply_to=target_topic,
+                    reverse=True
                 )
             
             if not chunk:
@@ -4634,9 +4635,9 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
             for m in chunk:
                 scanned += 1
                 
-                if end_date and m.date > end_date:
-                    continue
                 if start_date and m.date < start_date:
+                    continue
+                if end_date and m.date > end_date:
                     break
  
                 sender_id = m.sender_id
@@ -4658,7 +4659,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
             
             if limit and collected >= limit:
                 break
-            if start_date and chunk[-1].date < start_date:
+            if end_date and chunk[-1].date > end_date:
                 break
                 
             offset_id = chunk[-1].id
@@ -4680,8 +4681,6 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
         if not running_tasks.get(task_key):
             bot.send_message(admin_chat_id, f"🛑 History scrape for `{s_title}` stopped by user.")
             return
-
-        collected_messages.reverse()
         
         grouped_batches = []
         temp_group = []
@@ -5080,7 +5079,8 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     source_chat,
                     limit=cur_limit,
                     offset_id=offset_id,
-                    reply_to=target_topic
+                    reply_to=target_topic,
+                    reverse=True
                 )
                 
             if not chunk:
@@ -5155,9 +5155,9 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     pass
             await asyncio.sleep(1.0)
 
-        task_was_stopped = not running_tasks.get(task_key)
-
-        collected_messages.reverse()
+        if not running_tasks.get(task_key) and not collected_messages:
+            bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user. No messages fetched.")
+            return
         
         grouped_batches = []
         temp_group = []
@@ -5196,18 +5196,11 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         total_collected = len(collected_messages)
 
         for batch in grouped_batches:
-            if not running_tasks.get(task_key):
-                task_was_stopped = True
-
+            is_task_active = running_tasks.get(task_key)
             opts = collection_options.setdefault(task_key, {})
-            if task_was_stopped:
-                opts["status"] = "Saving"
-                curr_instant = False
-                instant_filter = "everything"
-            else:
-                opts["status"] = "Forwarding"
-                curr_instant = opts.get("instant_release", False)
-                instant_filter = opts.get("instant_filter", "everything")
+            opts["status"] = "Forwarding" if is_task_active else "Saving"
+            curr_instant = opts.get("instant_release", False) and is_task_active
+            instant_filter = opts.get("instant_filter", "everything")
 
             matching_batch = []
             for msg in batch:
@@ -5255,17 +5248,50 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                 sent_count += len(matching_batch)
                         else:
                             try:
-                                target_entity = await resolve_target_id(userbot, tid)
-                                is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
-                                top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
-                                
-                                fwd_res = await userbot(functions.messages.ForwardMessagesRequest(
-                                    from_peer=src_peer,
-                                    id=[msg.id for msg in matching_batch],
-                                    to_peer=target_entity,
-                                    random_id=random_ids,
-                                    top_msg_id=top_msg_id_val
-                                ))
+                                async with userbot_lock:
+                                    src_peer = await userbot.get_input_entity(int(sid))
+                                    tgt_peer = await userbot.get_input_entity(int(tid))
+                                    dest_topic_id = t_topic
+                                    if auto_mirror:
+                                        first_msg = matching_batch[0]
+                                        s_top = None
+                                        if first_msg.reply_to:
+                                            s_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
+                                        if s_top:
+                                            mapped_topic = get_topic_mapping(sid, s_top, tid)
+                                            if mapped_topic:
+                                                dest_topic_id = mapped_topic
+                                            else:
+                                                forum = getattr(first_msg.reply_to, "forum_topic", None)
+                                                src_title = getattr(forum, "title", None)
+                                                src_icon = getattr(forum, "icon_emoji_id", None)
+                                                if not src_title:
+                                                    try:
+                                                        res = await userbot(functions.messages.GetForumTopicsRequest(
+                                                            peer=src_peer, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                                        ))
+                                                        for t in res.topics:
+                                                            if t.id == s_top:
+                                                                src_title = t.title
+                                                                src_icon = getattr(t, "icon_emoji_id", None)
+                                                                break
+                                                    except Exception: pass
+                                                if src_title:
+                                                    dest_topic_id = await get_or_create_target_topic(userbot, tid, src_title, sid, s_top, icon_emoji_id=src_icon)
+
+                                    import random
+                                    random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in matching_batch]
+                                    target_entity = await resolve_target_id(userbot, tid)
+                                    is_forum = getattr(target_entity, 'forum', False) if not isinstance(target_entity, int) else False
+                                    top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
+                                    
+                                    fwd_res = await userbot(functions.messages.ForwardMessagesRequest(
+                                        from_peer=src_peer,
+                                        id=[msg.id for msg in matching_batch],
+                                        to_peer=target_entity,
+                                        random_id=random_ids,
+                                        top_msg_id=top_msg_id_val
+                                    ))
                                 if fwd_res:
                                     fwd_msgs = []
                                     if hasattr(fwd_res, 'updates'):
@@ -5278,7 +5304,8 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                 sent_count += len(matching_batch)
                             except Exception as fwd_err:
                                 logger.error(f"Native Forward in collection failed ({fwd_err}). Falling back to mirror...")
-                                await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid)
+                                async with userbot_lock:
+                                    await send_mirrored_content(userbot, tid, matching_batch, t_topic, auto_mirror, sid)
                                 sent_count += len(matching_batch)
                     except Exception as fe:
                         logger.error(f"Failed to forward batch: {fe}")
@@ -5387,20 +5414,22 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
             curr_filter = opts.get("instant_filter", "everything")
 
             # Edit status message
-            try:
-                bot.edit_message_text(
-                    get_collection_status_text(task_key),
-                    admin_chat_id,
-                    status_msg.message_id,
-                    reply_markup=get_collection_markup(pair_id),
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
+            if is_task_active:
+                try:
+                    bot.edit_message_text(
+                        get_collection_status_text(task_key),
+                        admin_chat_id,
+                        status_msg.message_id,
+                        reply_markup=get_collection_markup(pair_id),
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
                 
-            await asyncio.sleep(0.5) # Flood wait safety buffer
+            if is_task_active:
+                await asyncio.sleep(0.5) # Flood wait safety buffer
 
-        if not task_was_stopped:
+        if running_tasks.get(task_key):
             opts = collection_options.setdefault(task_key, {})
             opts["status"] = "Completed"
             opts["progress"] = 100
@@ -5422,19 +5451,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
             sent_label = f"Sent to Target: `{sent_count}`{f_label}" if curr_instant else f"Sent to Target: `{sent_count} (Hold Mode)`"
             bot.send_message(admin_chat_id, f"✅ Collection Done: `{s_title}`\nScanned: `{scanned}`\nCollected & Saved: `{collected}`\n{sent_label}")
         else:
-            opts = collection_options.setdefault(task_key, {})
-            opts["status"] = "Stopped"
-            try:
-                bot.edit_message_text(
-                    get_collection_status_text(task_key, is_done=False, status_text="Stopped"),
-                    admin_chat_id,
-                    status_msg.message_id,
-                    reply_markup=get_collection_markup(pair_id),
-                    parse_mode="HTML"
-                )
-            except Exception:
-                pass
-            bot.send_message(admin_chat_id, f"🛑 Collection Stopped by User: `{s_title}`\nScanned: `{scanned}`\nCollected & Saved: `{collected}`")
+            bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user.\nScanned: `{scanned}`\nCollected & Saved (Pending release): `{collected}`")
     except Exception as e:
         bot.send_message(admin_chat_id, f"❌ Collection Error: {e}")
     finally:
@@ -5462,8 +5479,9 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
     
         try:
             # Pre-resolve entities to warm up Telethon cache and ensure access
-            source_chat = await resolve_target_id(userbot, sid_ref)
-            target_chat = await resolve_target_id(userbot, tid_ref)
+            async with userbot_lock:
+                source_chat = await resolve_target_id(userbot, sid_ref)
+                target_chat = await resolve_target_id(userbot, tid_ref)
         except Exception as e:
             bot.send_message(admin_chat_id, f"❌ Connection Error: {e}\n\nMake sure the bot is a member of both chats.")
             return
@@ -5506,7 +5524,8 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
             
             advance = True
             try:
-                msg = await userbot.get_messages(source_chat, ids=smid)
+                async with userbot_lock:
+                    msg = await userbot.get_messages(source_chat, ids=smid)
                 if not msg:
                     # Message is deleted/empty, mark it as inaccessible/skipped so we don't loop on it
                     with db_conn() as conn:
@@ -5572,12 +5591,13 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
 
                 sent_msg = None
                 try:
-                    sent_msg = await userbot.send_message(
-                        entity=target_chat,
-                        message=msg.message or "",
-                        file=msg.media,
-                        reply_to=int(final_reply_target) if final_reply_target else None
-                    )
+                    async with userbot_lock:
+                        sent_msg = await userbot.send_message(
+                            entity=target_chat,
+                            message=msg.message or "",
+                            file=msg.media,
+                            reply_to=int(final_reply_target) if final_reply_target else None
+                        )
                 except Exception as e:
                     # If we had a reply target, attempt to fallback/downgrade reply first
                     if final_reply_target is not None:
@@ -5588,22 +5608,24 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                         
                         logger.warning(f"⚠️ RELEASE: Failed to send with reply_to={final_reply_target} ({e}). Retrying with reply_to={next_reply}...")
                         try:
-                            sent_msg = await userbot.send_message(
-                                entity=target_chat,
-                                message=msg.message or "",
-                                file=msg.media,
-                                reply_to=next_reply
-                            )
+                            async with userbot_lock:
+                                sent_msg = await userbot.send_message(
+                                    entity=target_chat,
+                                    message=msg.message or "",
+                                    file=msg.media,
+                                    reply_to=next_reply
+                                )
                         except Exception as e2:
                             if next_reply is not None:
                                 logger.warning(f"⚠️ RELEASE: Failed to send with reply_to={next_reply} ({e2}). Retrying with reply_to=None...")
                                 try:
-                                    sent_msg = await userbot.send_message(
-                                        entity=target_chat,
-                                        message=msg.message or "",
-                                        file=msg.media,
-                                        reply_to=None
-                                    )
+                                    async with userbot_lock:
+                                        sent_msg = await userbot.send_message(
+                                            entity=target_chat,
+                                            message=msg.message or "",
+                                            file=msg.media,
+                                            reply_to=None
+                                        )
                                 except Exception as e3:
                                     e = e3
                             else:
@@ -5616,19 +5638,21 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                             logger.info("🛡️ RELEASE: Protected or invalid peer media detected. Attempting download & upload fallback...")
                             local_file = None
                             try:
-                                local_file = await userbot.download_media(msg)
+                                async with userbot_lock:
+                                    local_file = await userbot.download_media(msg)
                             except errors.FloodWaitError as fwe:
                                 raise fwe
                             except Exception as de:
                                 logger.error(f"Failed to download media in release fallback: {de}")
                             if local_file:
                                 try:
-                                    sent_msg = await userbot.send_message(
-                                        entity=target_chat,
-                                        message=msg.message or "",
-                                        file=local_file,
-                                        reply_to=int(final_reply_target) if final_reply_target else None
-                                    )
+                                    async with userbot_lock:
+                                        sent_msg = await userbot.send_message(
+                                            entity=target_chat,
+                                            message=msg.message or "",
+                                            file=local_file,
+                                            reply_to=int(final_reply_target) if final_reply_target else None
+                                        )
                                 except Exception as fe:
                                     # Downgrade in fallback as well
                                     if final_reply_target is not None:
@@ -5639,26 +5663,28 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
                                         
                                         logger.warning(f"⚠️ RELEASE FALLBACK: Failed to send with reply_to={final_reply_target} ({fe}). Retrying with reply_to={next_reply}...")
                                         try:
-                                            sent_msg = await userbot.send_message(
-                                                entity=target_chat,
-                                                message=msg.message or "",
-                                                file=local_file,
-                                                reply_to=next_reply
-                                            )
-                                        except Exception as fe2:
-                                            if next_reply is not None:
-                                                logger.warning(f"⚠️ RELEASE FALLBACK: Failed to send with reply_to={next_reply} ({fe2}). Retrying with reply_to=None...")
-                                                try:
-                                                    sent_msg = await userbot.send_message(
-                                                        entity=target_chat,
-                                                        message=msg.message or "",
-                                                        file=local_file,
-                                                        reply_to=None
-                                                    )
-                                                except Exception as fe3:
-                                                    raise fe3
-                                            else:
-                                                raise fe2
+                                            async with userbot_lock:
+                                                sent_msg = await userbot.send_message(
+                                                    entity=target_chat,
+                                                    message=msg.message or "",
+                                                    file=local_file,
+                                                    reply_to=next_reply
+                                                )
+                                            except Exception as fe2:
+                                                if next_reply is not None:
+                                                    logger.warning(f"⚠️ RELEASE FALLBACK: Failed to send with reply_to={next_reply} ({fe2}). Retrying with reply_to=None...")
+                                                    try:
+                                                        async with userbot_lock:
+                                                            sent_msg = await userbot.send_message(
+                                                                entity=target_chat,
+                                                                message=msg.message or "",
+                                                                file=local_file,
+                                                                reply_to=None
+                                                            )
+                                                    except Exception as fe3:
+                                                        raise fe3
+                                                else:
+                                                    raise fe2
                                     else:
                                         raise fe
                                 finally:
