@@ -4625,7 +4625,8 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     target_chat,
                     limit=chunk_size,
                     offset_id=offset_id,
-                    reply_to=target_topic
+                    reply_to=target_topic,
+                    reverse=True
                 )
             
             if not chunk:
@@ -4634,9 +4635,9 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
             for m in chunk:
                 scanned += 1
                 
-                if end_date and m.date > end_date:
-                    continue
                 if start_date and m.date < start_date:
+                    continue
+                if end_date and m.date > end_date:
                     break
  
                 sender_id = m.sender_id
@@ -4658,7 +4659,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
             
             if limit and collected >= limit:
                 break
-            if start_date and chunk[-1].date < start_date:
+            if end_date and chunk[-1].date > end_date:
                 break
                 
             offset_id = chunk[-1].id
@@ -4680,8 +4681,6 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
         if not running_tasks.get(task_key):
             bot.send_message(admin_chat_id, f"🛑 History scrape for `{s_title}` stopped by user.")
             return
-
-        collected_messages.reverse()
         
         grouped_batches = []
         temp_group = []
@@ -5080,7 +5079,8 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     source_chat,
                     limit=cur_limit,
                     offset_id=offset_id,
-                    reply_to=target_topic
+                    reply_to=target_topic,
+                    reverse=True
                 )
                 
             if not chunk:
@@ -5158,8 +5158,6 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         if not running_tasks.get(task_key) and not collected_messages:
             bot.send_message(admin_chat_id, f"🛑 Collection for `{s_title}` stopped by user. No messages fetched.")
             return
-
-        collected_messages.reverse()
         
         grouped_batches = []
         temp_group = []
