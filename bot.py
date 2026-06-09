@@ -1917,6 +1917,10 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
         # 1. Resolve Topic Mapping
         if is_mir:
             source_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or (first_msg.reply_to.reply_to_msg_id if first_msg.reply_to else None)
+            if not source_top and getattr(first_msg, 'forum_topic', False):
+                source_top = first_msg.id
+            if not source_top and first_msg.reply_to_msg_id:
+                source_top = first_msg.reply_to_msg_id
             if source_top:
                 forum = getattr(first_msg.reply_to, "forum_topic", None)
                 src_title = getattr(forum, "title", None)
@@ -4757,9 +4761,11 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                             dest_topic_id = t_topic
                             if is_mir:
                                 first_msg = batch[0]
-                                s_top = None
-                                if first_msg.reply_to:
-                                    s_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
+                                s_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or (first_msg.reply_to.reply_to_msg_id if first_msg.reply_to else None)
+                                if not s_top and getattr(first_msg, 'forum_topic', False):
+                                    s_top = first_msg.id
+                                if not s_top and first_msg.reply_to_msg_id:
+                                    s_top = first_msg.reply_to_msg_id
                                 if s_top:
                                     mapped_topic = get_topic_mapping(sid, s_top, tid)
                                     if mapped_topic:
@@ -5229,9 +5235,11 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                         dest_topic_id = t_topic
                                         if auto_mirror:
                                             first_msg = matching_batch[0]
-                                            s_top = None
-                                            if first_msg.reply_to:
-                                                s_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or first_msg.reply_to.reply_to_msg_id
+                                            s_top = getattr(first_msg.reply_to, 'reply_to_top_id', None) or (first_msg.reply_to.reply_to_msg_id if first_msg.reply_to else None)
+                                            if not s_top and getattr(first_msg, 'forum_topic', False):
+                                                s_top = first_msg.id
+                                            if not s_top and first_msg.reply_to_msg_id:
+                                                s_top = first_msg.reply_to_msg_id
                                             if s_top:
                                                 mapped_topic = get_topic_mapping(sid, s_top, tid)
                                                 if mapped_topic:
@@ -5544,15 +5552,40 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
 
                 # Handle Mirroring ID detection for release
                 if auto_mirror:
-                    s_top = None
-                    if msg.reply_to:
-                        s_top = getattr(msg.reply_to, 'reply_to_top_id', None) or msg.reply_to.reply_to_msg_id
+                    s_top = getattr(msg.reply_to, 'reply_to_top_id', None) or (msg.reply_to.reply_to_msg_id if msg.reply_to else None)
+                    if not s_top and getattr(msg, 'forum_topic', False):
+                        s_top = msg.id
+                    if not s_top and msg.reply_to_msg_id:
+                        s_top = msg.reply_to_msg_id
                     
                     if s_top:
                         # Priority check database mapping
                         mapped = get_topic_mapping(sid_ref, s_top, tid_ref)
                         if mapped:
                             target_topic_anchor = mapped
+                        else:
+                            # Search for title/icon in source chat to mirror dynamically
+                            forum = getattr(msg.reply_to, "forum_topic", None) if msg.reply_to else None
+                            src_title = getattr(forum, "title", None)
+                            src_icon = getattr(forum, "icon_emoji_id", None)
+                            if not src_title:
+                                try:
+                                    async with userbot_lock:
+                                        res = await userbot(functions.messages.GetForumTopicsRequest(
+                                            peer=source_chat, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                        ))
+                                    for t in res.topics:
+                                        if t.id == s_top:
+                                            src_title = t.title
+                                            src_icon = getattr(t, "icon_emoji_id", None)
+                                            break
+                                except Exception as e:
+                                    logger.error(f"Failed to fetch source forum topics in release: {e}")
+                            
+                            if src_title:
+                                target_topic_anchor = await get_or_create_target_topic(
+                                    userbot, tid_ref, src_title, sid_ref, s_top, icon_emoji_id=src_icon
+                                )
 
                 # Resolve reply mapping
                 reply_to_val = None
