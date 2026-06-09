@@ -2081,17 +2081,38 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
 
         for attempt in range(3):
             try:
-                sent = await client.send_message(
-                    entity=target_entity, 
-                    message=album_text, 
-                    file=file_to_send,
-                    reply_to=reply_header
-                )
-                if sent:
-                    first_id = sent[0].id if isinstance(sent, list) else sent.id
-                    logger.info(f"✅ MIRROR: Sent to {tid} -> MSG ID: {first_id}")
-                    save_message_mapping(sid, first_msg.id, tid, first_id)
-                    break # Success!
+                # Attempt native forward first if not restricted/pre-downloaded to preserve the forward tag
+                if not pre_downloaded and not downloaded_files:
+                    try:
+                        # forward_messages takes comment_to for threads/topics or a simple forward mapping
+                        # Telethon's forward_messages does not take reply_to. It accepts comment_to.
+                        sent = await client.forward_messages(
+                            entity=target_entity,
+                            messages=messages,
+                            from_peer=int(sid),
+                            comment_to=reply_header
+                        )
+                        if sent:
+                            first_id = sent[0].id if isinstance(sent, list) else sent.id
+                            logger.info(f"✅ MIRROR: Sent via native forward to {tid} -> MSG ID: {first_id}")
+                            save_message_mapping(sid, first_msg.id, tid, first_id)
+                            break
+                    except Exception as fwd_err:
+                        logger.warning(f"Native forward in mirror failed: {fwd_err}. Trying send_message copy fallback...")
+
+                # Fallback to copy/re-upload system
+                if not sent:
+                    sent = await client.send_message(
+                        entity=target_entity, 
+                        message=album_text, 
+                        file=file_to_send,
+                        reply_to=reply_header
+                    )
+                    if sent:
+                        first_id = sent[0].id if isinstance(sent, list) else sent.id
+                        logger.info(f"✅ MIRROR: Sent via send_message to {tid} -> MSG ID: {first_id}")
+                        save_message_mapping(sid, first_msg.id, tid, first_id)
+                        break # Success!
             except errors.FloodWaitError as fwe:
                 logger.warning(f"⏳ MIRROR FLOOD: Waiting {fwe.seconds}s...")
                 await asyncio.sleep(fwe.seconds)
