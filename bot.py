@@ -2452,6 +2452,10 @@ def setup_automation_handlers(client: TelegramClient):
     async def auto_handler(event):
         m = event.message
         if not m: return
+        
+        # Skip Telegram service/action messages (e.g., user joined, user left, group title changed, pin message, etc.)
+        if getattr(m, 'action', None):
+            return
 
         # FAST DROP: Immediately ignore messages if the source chat isn't in configured pairs
         # This prevents unconfigured active channels from flooding your CPU loop
@@ -5181,6 +5185,11 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 scanned += 1
                 progress = int((scanned / total_to_fetch) * 100)
                 if progress > 100: progress = 100
+                
+                # Skip Telegram service/action messages (e.g., user joined, left, etc.)
+                if getattr(m, 'action', None):
+                    opts.update({"scanned": scanned, "progress": progress})
+                    continue
                 
                 sender_id = m.sender_id
                 sender_username = getattr(m.sender, 'username', None)
