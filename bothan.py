@@ -36,8 +36,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # Replace 0 with your actual Telegram User ID (e.g., 12345678)
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "groups_tracker.db")
 
-if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or ADMIN_ID == 0:
-    logger.warning("⚠️ Please configure your BOT_TOKEN and ADMIN_ID at the top of the script or set them as environment variables!")
+# if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or ADMIN_ID == 0:
+#     logger.warning("⚠️ Please configure your BOT_TOKEN and ADMIN_ID at the top of the script or set them as environment variables!")
 
 # ---------------------------------------------------------
 # 3. DATABASE PERSISTENCE LAYER (SQLite)
