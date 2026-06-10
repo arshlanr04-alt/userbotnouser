@@ -117,6 +117,14 @@ init_db()
 # Bypass any environment-level proxy that might be broken/misconfigured
 telebot.apihelper.proxy = {}
 
+if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE" or ":" not in BOT_TOKEN:
+    logger.critical("❌ Invalid or missing BOT_TOKEN! Please configure your BOT_TOKEN at the top of the script or set it as an environment variable (e.g., BOT_TOKEN=123456:ABC-def...).")
+    sys.exit(1)
+
+if ADMIN_ID == 0:
+    logger.critical("❌ Invalid or missing ADMIN_ID! Please configure your ADMIN_ID at the top of the script or set it as an environment variable (e.g., ADMIN_ID=123456789).")
+    sys.exit(1)
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # Verify connectivity before launching the polling thread
