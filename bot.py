@@ -1888,28 +1888,12 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
         try:
             if not is_restricted:
                 try:
-                    import random
-                    random_ids = [random.randint(-9223372036854775808, 9223372036854775807) for _ in messages]
-                    is_forum = getattr(target_peer, 'forum', False) if not isinstance(target_peer, int) else False
-                    top_msg_id_val = int(dest_topic_id) if (is_forum and dest_topic_id) else None
-                    
-                    sent_fwd = await client(functions.messages.ForwardMessagesRequest(
-                        from_peer=await client.get_input_entity(int(source_chat_id)),
-                        id=[msg.id for msg in messages],
-                        to_peer=target_peer,
-                        random_id=random_ids,
-                        top_msg_id=top_msg_id_val
-                    ))
-                    
-                    if sent_fwd:
-                        fwd_msgs = []
-                        if hasattr(sent_fwd, 'updates'):
-                            for u in sent_fwd.updates:
-                                if type(u).__name__ in ["UpdateNewMessage", "UpdateNewChannelMessage"]:
-                                    fwd_msgs.append(u.message)
-                        vaulted_result = fwd_msgs if len(fwd_msgs) > 1 else (fwd_msgs[0] if fwd_msgs else None)
-                    else:
-                        vaulted_result = None
+                    vaulted_result = await client.forward_messages(
+                        entity=target_peer,
+                        messages=messages,
+                        from_peer=source_chat_id,
+                        reply_to=int(dest_topic_id) if dest_topic_id else None
+                    )
                 except Exception as fwd_err:
                     logger.warning(f"Native forward to vault failed: {fwd_err}. Falling back to send_message.")
                     vaulted_result = await client.send_message(
@@ -2077,16 +2061,16 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                         if m.id in pre_downloaded:
                             files_to_send.append(pre_downloaded[m.id])
                         else:
-                            files_to_send.append(m)
+                            files_to_send.append(m.media)
             elif isinstance(pre_downloaded, list):
                 media_msgs = [m for m in messages if m.media]
                 for idx, m in enumerate(media_msgs):
                     if idx < len(pre_downloaded):
                         files_to_send.append(pre_downloaded[idx])
                     else:
-                        files_to_send.append(m)
+                        files_to_send.append(m.media)
         else:
-            files_to_send = [m for m in messages if m.media]
+            files_to_send = [m.media for m in messages if m.media]
             
         file_to_send = files_to_send if len(files_to_send) > 1 else (files_to_send[0] if files_to_send else None)
         
@@ -2385,7 +2369,7 @@ async def process_automation_pipeline(client, messages, source_chat_id):
             # Execution Step B: Live Mirror/Forward Engine Routine
             if is_live:
                 is_reply = any(getattr(msg, 'reply_to_msg_id', None) for msg in valid_messages)
-                if is_protected_flow or is_reply:
+                if is_protected_flow:
                     has_media = any(m.media for m in valid_messages)
                     if is_protected_flow and has_media and not any(m.id in media_to_file for m in valid_messages):
                         logger.warning(f"🛡️ PIPELINE: Skipping live mirror for target {tid} (Download Failed).")
@@ -3007,10 +2991,7 @@ def setup_automation_handlers(client: TelegramClient):
         if m.text and not m.text.strip().startswith('.'):
             if event.is_private:
                 is_admin_or_mgr = (m.sender_id == ADMIN_ID) or (me and m.sender_id == me.id) or is_authorized_manager(m.sender_id)
-                # Verify the chat itself is with the ADMIN, a manager, or self
-                chat_partner_id = event.chat_id
-                is_authorized_chat = (chat_partner_id == ADMIN_ID) or (me and chat_partner_id == me.id) or is_authorized_manager(chat_partner_id)
-                if is_admin_or_mgr and is_authorized_chat:
+                if is_admin_or_mgr:
                     parsed_ref = parse_telegram_link(m.text.strip())
                     if parsed_ref:
                         await event.reply(
@@ -5344,8 +5325,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                         if curr_instant and matching_batch:
                             try:
                                 has_media = any(msg.media for msg in matching_batch)
-                                is_reply = any(getattr(msg, 'reply_to_msg_id', None) for msg in matching_batch)
-                                if is_protected_flow or is_reply:
+                                if is_protected_flow:
                                     if has_media and not any(msg.id in media_to_file for msg in matching_batch):
                                         logger.warning("🛡️ COLLECTION: Skipping mirror because media download failed/skipped.")
                                         opts["skipped"] += len(matching_batch)
