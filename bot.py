@@ -4295,17 +4295,28 @@ def handle_callbacks(call):
     elif data.startswith("pair_collect_confirm_"):
         # Format: pair_collect_confirm_{pair_id}
         pid = int(data.split("_")[-1])
+        logger.info(f"COLLECT_CONFIRM CLICKED: {pid}")
         bot.answer_callback_query(call.id, "🚀 Starting Collection...")
         
         async def transition_and_start(chat_id, msg_id, pair_id):
+            logger.info(f"TRANSITION START: {pair_id}")
             try:
                 bot.delete_message(chat_id, msg_id)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"DELETE ERROR: {e}")
             task_key = f"coll_{pair_id}"
             if task_key in collection_options:
                 collection_options[task_key].clear()
-            await run_collection(chat_id, pair_id)
+            logger.info(f"CALLING run_collection({pair_id})")
+            try:
+                await run_collection(chat_id, pair_id)
+                logger.info(f"run_collection RETURNED: {pair_id}")
+            except Exception as e:
+                logger.exception(f"COLLECTION CRASH: {e}")
+                try:
+                    bot.send_message(chat_id, f"❌ Collection crashed:\n<code>{e}</code>", parse_mode="HTML")
+                except Exception:
+                    pass
             
         asyncio.run_coroutine_threadsafe(transition_and_start(call.message.chat.id, call.message.message_id, pid), loop)
 
@@ -5401,8 +5412,11 @@ async def run_collection_preview(admin_chat_id, message_id, pair_id):
             pass
 
 async def run_collection(admin_chat_id, pair_id, limit=None):
+    logger.info(f"RUN_COLLECTION ENTERED: {pair_id}")
+    logger.info("Calling ensure_userbot()")
     is_ok, msg = await ensure_userbot()
     if not is_ok:
+        logger.error(f"Userbot error during run_collection ensure_userbot(): {msg}")
         bot.send_message(admin_chat_id, f"❌ Userbot error: {msg}")
         return
         
@@ -5412,8 +5426,11 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
     if task_key in collection_options:
         collection_options[task_key].clear()
         
+    logger.info("Calling get_target_pair()")
     row = get_target_pair(pair_id)
-    if not row: return
+    if not row:
+        logger.error(f"Target pair {pair_id} not found in database.")
+        return
     pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf = row
     collected = 0
     scanned = 0
@@ -5440,6 +5457,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         "status": "Fetching"
     }
     
+    logger.info("Sending status message")
     status_msg = bot.send_message(
         admin_chat_id, 
         get_collection_status_text(task_key), 
@@ -5448,7 +5466,9 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
     )
     
     try:
+        logger.info("Resolving source chat")
         source_chat = await resolve_target_id(userbot, sid)
+        logger.info("Resolving target chat")
         dest_chat = await resolve_target_id(userbot, tid)
         
         target_topic = None
