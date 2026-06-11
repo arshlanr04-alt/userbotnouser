@@ -4294,8 +4294,7 @@ def handle_callbacks(call):
 
     elif data.startswith("pair_collect_confirm_"):
         # Format: pair_collect_confirm_{pair_id}
-        parts = data.split("_")
-        pid = int(parts[3])
+        pid = int(data.split("_")[-1])
         bot.answer_callback_query(call.id, "🚀 Starting Collection...")
         
         async def transition_and_start(chat_id, msg_id, pair_id):
@@ -4312,8 +4311,7 @@ def handle_callbacks(call):
 
     elif data.startswith("pair_collect_cancel_"):
         # Format: pair_collect_cancel_{pair_id}
-        parts = data.split("_")
-        pid = int(parts[3])
+        pid = int(data.split("_")[-1])
         bot.answer_callback_query(call.id, "❌ Collection Canceled")
         # Edit message back to pair view
         handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': call.id}))
