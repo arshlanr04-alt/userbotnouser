@@ -6,3 +6,4 @@ telebot
 flask
 telethon
 psycopg2
+requires-python = ">=3.13"
