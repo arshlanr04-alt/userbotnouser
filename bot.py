@@ -5413,7 +5413,6 @@ async def run_collection_preview(admin_chat_id, message_id, pair_id):
 
 async def run_collection(admin_chat_id, pair_id, limit=None):
     logger.info(f"RUN_COLLECTION ENTERED: {pair_id}")
-    logger.info("Calling ensure_userbot()")
     is_ok, msg = await ensure_userbot()
     if not is_ok:
         logger.error(f"Userbot error during run_collection ensure_userbot(): {msg}")
@@ -5422,11 +5421,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         
     task_key = f"coll_{pair_id}"
     running_tasks[task_key] = True
-    
-    if task_key in collection_options:
-        collection_options[task_key].clear()
         
-    logger.info("Calling get_target_pair()")
     row = get_target_pair(pair_id)
     if not row:
         logger.error(f"Target pair {pair_id} not found in database.")
@@ -5440,6 +5435,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
     if default_cf not in ["everything", "media", "text", "file"]:
         default_cf = "everything"
         
+    # DIRECT ASSIGNMENT (Do not use .clear() to prevent reading empty dictionaries during async switches)
     collection_options[task_key] = {
         "instant_release": bool(is_live),
         "instant_filter": "everything",
@@ -5490,7 +5486,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         if total_to_fetch <= 0:
             total_to_fetch = 1
 
-        opts = collection_options.setdefault(task_key, {})
+        opts = collection_options[task_key]
         opts["status"] = "Fetching"
         
         offset_id = 0
@@ -5584,7 +5580,6 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 })
 
             if chunk_valid:
-                # Group chunk messages by grouped_id
                 chunk_batches = []
                 temp_group = []
                 for m in chunk_valid:
@@ -5730,7 +5725,6 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                 logger.error(f"Failed to forward batch: {fe}")
                                 opts["skipped"] += len(matching_batch)
                         
-                        # Save to database
                         with db_conn() as conn:
                             c = conn.cursor()
                             for m in batch:
@@ -5779,7 +5773,6 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                     )
                             conn.commit()
 
-                        # Send to log bots
                         if should_vault and batch:
                             if is_protected_flow:
                                 files_to_vault = [media_to_file.get(m.id) for m in batch if m.id in media_to_file]
@@ -5789,7 +5782,6 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                         metadata = f"SID: {sid} | MID: {batch[0].id}\n"
                                         caption_text = metadata + (batch[0].message or "")
                                         
-                                        # Resolve vault topic mirroring
                                         vault_topic_id = None
                                         try:
                                             vault_entity = await resolve_target_id(userbot, int(bot_id))
@@ -5809,9 +5801,10 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                                         src_icon = getattr(forum, "icon_emoji_id", None)
                                                         if not src_title:
                                                             try:
-                                                                res = await userbot(functions.messages.GetForumTopicsRequest(
-                                                                    peer=source_chat, offset_date=0, offset_id=0, offset_topic=0, limit=100
-                                                                ))
+                                                                async with userbot_lock:
+                                                                    res = await userbot(functions.messages.GetForumTopicsRequest(
+                                                                        peer=source_chat, offset_date=0, offset_id=0, offset_topic=0, limit=100
+                                                                    ))
                                                                 for t in res.topics:
                                                                     if t.id == s_top:
                                                                         src_title = t.title
@@ -5826,12 +5819,13 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                             logger.error(f"Error resolving topic for vault group {bot_id}: {topic_err}")
 
                                         try:
-                                            vaulted_result = await userbot.send_message(
-                                                entity=int(bot_id),
-                                                file=file_payload,
-                                                message=caption_text,
-                                                reply_to=int(vault_topic_id) if vault_topic_id else None
-                                            )
+                                            async with userbot_lock:
+                                                vaulted_result = await userbot.send_message(
+                                                    entity=int(bot_id),
+                                                    file=file_payload,
+                                                    message=caption_text,
+                                                    reply_to=int(vault_topic_id) if vault_topic_id else None
+                                                )
                                             if vaulted_result:
                                                 v_msgs = vaulted_result if isinstance(vaulted_result, list) else [vaulted_result]
                                                 for i, v_m in enumerate(v_msgs):
