@@ -1011,6 +1011,13 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
         return
 
     running_tasks[task_key] = True
+    vault_release_options[task_key] = {
+        "source_id": source_id,
+        "target_id": target_id,
+        "total": 0,
+        "success": 0,
+        "failed": 0
+    }
     
     try:
         # Get items to release
@@ -1024,6 +1031,7 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
             items = items[:limit]
 
         total = len(items)
+        vault_release_options[task_key]["total"] = total
         success = 0
         failed = 0
         
@@ -1101,6 +1109,9 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
                 logger.error(f"Vault Release group error: {e}")
                 failed += len(group)
 
+            vault_release_options[task_key]["success"] = success
+            vault_release_options[task_key]["failed"] = failed
+
             if (i + 1) % 5 == 0 or (i + 1) == total_groups:
                 try: sender_bot.edit_message_text(f"📊 *Status:* `{i+1}/{total}`\n✅ Success: `{success}`\n❌ Failed: `{failed}`", admin_chat_id, status_msg.message_id, reply_markup=stop_markup, parse_mode="Markdown")
                 except Exception: pass
@@ -1113,6 +1124,7 @@ async def run_vault_release(sender_bot, admin_chat_id, source_id, target_id, int
         sender_bot.send_message(admin_chat_id, f"❌ Engine Error: {e}")
     finally:
         running_tasks.pop(task_key, None)
+        vault_release_options.pop(task_key, None)
 
 def save_logged_media(bot_id, log_msg_id, source_chat_id, source_msg_id, file_id, media_type, caption, grouped_id=None):
     with db_conn() as conn:
@@ -1182,6 +1194,72 @@ admin_states = {}
 login_data = {} # Temporary storage for login steps
 running_tasks = {} # Track long-running tasks for cancellation: { "hist_1": True, "coll_1": True }
 collection_options = {} # Track collection options for active tasks: { "coll_1": {"instant_release": False} }
+history_options = {} # Track history scrape options: { "hist_1": { ... } }
+vault_release_options = {} # Track vault release tasks: { "vault_rel_1_2": { ... } }
+
+def get_active_tasks_report():
+    active = [k for k, v in running_tasks.items() if v]
+    if not active:
+        return "📭 *No ongoing tasks are currently active.*"
+    
+    lines = ["⚙️ *Ongoing Active Tasks:*"]
+    for key in active:
+        if key.startswith("coll_"):
+            try:
+                pid = int(key.split("_")[1])
+                opts = collection_options.get(key, {})
+                s_title = opts.get("s_title", f"Pair ID {pid}")
+                scanned = opts.get("scanned", 0)
+                collected = opts.get("collected", 0)
+                sent = opts.get("sent_count", 0)
+                filtered = opts.get("filtered", 0)
+                dups = opts.get("duplicates", 0)
+                status = opts.get("status", "Processing")
+                progress = opts.get("progress", 0)
+                lines.append(
+                    f"\n📥 *Collection (Pair {pid}):* `{s_title}`\n"
+                    f"• Status: `{status}` ({progress}%)\n"
+                    f"• Scanned: `{scanned}` | Collected: `{collected}`\n"
+                    f"• Forwarded: `{sent}` | Filtered: `{filtered}` | Dups: `{dups}`"
+                )
+            except Exception as e:
+                lines.append(f"\n📥 *Collection ({key}):* Error reading: {e}")
+        elif key.startswith("hist_"):
+            try:
+                pid = int(key.split("_")[1])
+                opts = history_options.get(key, {})
+                s_title = opts.get("s_title", f"Pair ID {pid}")
+                scanned = opts.get("scanned", 0)
+                collected = opts.get("collected", 0)
+                sent = opts.get("sent_count", 0)
+                limit = opts.get("limit")
+                limit_str = f"/{limit}" if limit else ""
+                lines.append(
+                    f"\n📜 *History Scrape (Pair {pid}):* `{s_title}`\n"
+                    f"• Scanned: `{scanned}`\n"
+                    f"• Collected: `{collected}{limit_str}` | Forwarded: `{sent}`"
+                )
+            except Exception as e:
+                lines.append(f"\n📜 *History Scrape ({key}):* Error reading: {e}")
+        elif key.startswith("vault_rel_"):
+            try:
+                opts = vault_release_options.get(key, {})
+                src = opts.get("source_id", "Unknown")
+                tgt = opts.get("target_id", "Unknown")
+                total = opts.get("total", 0)
+                success = opts.get("success", 0)
+                failed = opts.get("failed", 0)
+                lines.append(
+                    f"\n🚀 *Vault Release:* `{src}` ➡️ `{tgt}`\n"
+                    f"• Total: `{total}`\n"
+                    f"• Success: `{success}` | Failed: `{failed}`"
+                )
+            except Exception as e:
+                lines.append(f"\n🚀 *Vault Release ({key}):* Error reading: {e}")
+        else:
+            lines.append(f"\n⚙️ *Task:* `{key}`")
+            
+    return "\n".join(lines)
 
 def get_progress_bar(pct):
     """Generates a 20-character diamond progress bar string representing progress percentage."""
@@ -1513,7 +1591,7 @@ def pair_view_markup(pair_id, show_mirror=False):
     
     # Content Filter Button
     cf = pair[10] or "everything"
-    cf_map = {"everything": "🔄 All Content", "media": "🖼️ Media Only", "text": "📝 Text Only"}
+    cf_map = {"everything": "🔄 All Content", "media": "🖼️ Media Only", "text": "📝 Text Only", "file": "📁 Files Only"}
     cf_text = cf_map.get(cf, "🔄 All Content")
     markup.add(InlineKeyboardButton(f"Filter: {cf_text}", callback_data=f"pair_toggle_filter_{pair_id}"))
     
@@ -2340,9 +2418,13 @@ async def process_automation_pipeline(client, messages, source_chat_id):
             cf_val = cf or "everything"
             valid_messages = []
             for msg in messages:
-                has_media = bool(msg.media)
-                if cf_val == "media" and not has_media: continue
-                if cf_val == "text" and has_media: continue
+                m_type = get_specific_media_type(msg.media)
+                if cf_val == "media" and m_type not in ["photo", "video"]:
+                    continue
+                if cf_val == "text" and m_type != "text":
+                    continue
+                if cf_val == "file" and m_type != "file":
+                    continue
                 valid_messages.append(msg)
                 
             if not valid_messages:
@@ -2580,9 +2662,14 @@ def setup_automation_handlers(client: TelegramClient):
                 parts = text.split()
                 cmd = parts[0].lower()
                 
-                if cmd in ['.addpair', '.pair', '.delpair', '.listpairs', '.pairs', '.setpair', '.addmanager', '.delmanager', '.managers', '.join', '.setpromo', '.promo']:
+                if cmd in ['.addpair', '.pair', '.delpair', '.listpairs', '.pairs', '.setpair', '.addmanager', '.delmanager', '.managers', '.join', '.setpromo', '.promo', '.tasks', '.task']:
                     try:
-                        if cmd in ['.addpair', '.pair']:
+                        if cmd in ['.tasks', '.task']:
+                            report = get_active_tasks_report()
+                            await event.reply(report)
+                            return
+                            
+                        elif cmd in ['.addpair', '.pair']:
                             if len(parts) < 3:
                                 await event.reply("❌ **Usage:** `.addpair <source> <target>`\n(Source/Target can be usernames, links, topic links, or numeric IDs)")
                                 return
@@ -3160,6 +3247,12 @@ def cmd_extract_media(message):
 def cmd_ping(message):
     if message.from_user.id != ADMIN_ID: return
     bot.reply_to(message, f"🏓 *Pong!*\n\nI am currently awake and running.\nTime: `{datetime.now().strftime('%H:%M:%S')}`", parse_mode="Markdown")
+
+@bot.message_handler(commands=['tasks', 'task'])
+def cmd_tasks(message):
+    if not is_authorized_manager(message.from_user.id): return
+    report = get_active_tasks_report()
+    bot.send_message(message.chat.id, report, parse_mode="Markdown")
 
 @bot.message_handler(commands=['ban', 'block'])
 def cmd_ban_user(message):
@@ -4122,7 +4215,7 @@ def handle_callbacks(call):
         pair = get_target_pair(pid)
         if not pair: return
         current = pair[10] or "everything"
-        next_filter = "media" if current == "everything" else "text" if current == "media" else "everything"
+        next_filter = "media" if current == "everything" else "text" if current == "media" else "file" if current == "text" else "everything"
         
         with db_conn() as conn:
             c = conn.cursor()
@@ -4698,10 +4791,18 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
 
     task_key = f"hist_{pair_id}"
     running_tasks[task_key] = True
+    history_options[task_key] = {
+        "s_title": "Unknown Source",
+        "scanned": 0,
+        "collected": 0,
+        "sent_count": 0,
+        "limit": limit
+    }
     
     pair = get_target_pair(pair_id)
     if not pair: return
     pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf = pair
+    history_options[task_key]["s_title"] = s_title
     
     collected = 0
     scanned = 0
@@ -4755,10 +4856,20 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     continue
 
                 cf_val = cf or "everything"
-                if cf_val == "media" and not m.media:
+                m_type = get_specific_media_type(m.media)
+                if cf_val == "media" and m_type not in ["photo", "video"]:
                     continue
-                if cf_val == "text" and m.media:
+                if cf_val == "text" and m_type != "text":
                     continue
+                if cf_val == "file" and m_type != "file":
+                    continue
+
+                if task_key in history_options:
+                    history_options[task_key].update({
+                        "scanned": scanned,
+                        "collected": collected,
+                        "sent_count": sent_count
+                    })
 
                 collected_messages.append(m)
                 collected += 1
@@ -5001,6 +5112,13 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                         try: os.remove(temp_path)
                         except Exception: pass
                 
+            if task_key in history_options:
+                history_options[task_key].update({
+                    "scanned": scanned,
+                    "collected": collected,
+                    "sent_count": sent_count
+                })
+
             l_text = f" / {limit}" if limit else ""
             try:
                 bot.edit_message_text(
@@ -5020,6 +5138,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
         bot.send_message(admin_chat_id, f"❌ Scrape Error: {e}")
     finally:
         running_tasks.pop(task_key, None)
+        history_options.pop(task_key, None)
 
 async def resolve_target_id(client: TelegramClient, target_ref):
     from telethon.tl.types import PeerChannel, PeerChat, PeerUser
@@ -5290,9 +5409,12 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     matching_batch = []
                     for msg in batch:
                         matches = True
-                        if instant_filter == "media" and not msg.media:
+                        msg_type = get_specific_media_type(msg.media)
+                        if instant_filter == "media" and msg_type not in ["photo", "video"]:
                             matches = False
-                        elif instant_filter == "text" and msg.media:
+                        elif instant_filter == "text" and msg_type != "text":
+                            matches = False
+                        elif instant_filter == "file" and msg_type != "file":
                             matches = False
                         if matches:
                             matching_batch.append(msg)
@@ -5573,7 +5695,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 
             curr_instant = opts.get("instant_release", False)
             instant_filter = opts.get("instant_filter", "everything")
-            f_map = {"everything": "All Content", "media": "Media Only", "text": "Text Only"}
+            f_map = {"everything": "All Content", "media": "Media Only", "text": "Text Only", "file": "Files Only"}
             f_label = f" matching {f_map.get(instant_filter, 'All Content')} 🔄" if curr_instant else ""
             sent_label = f"Sent to Target: `{sent_count}`{f_label}" if curr_instant else f"Sent to Target: `{sent_count} (Hold Mode)`"
             bot.send_message(admin_chat_id, f"✅ Collection Done: `{s_title}`\nScanned: `{scanned}`\nCollected & Saved: `{collected}`\n{sent_label}")
