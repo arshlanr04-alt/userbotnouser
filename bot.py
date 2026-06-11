@@ -5321,16 +5321,20 @@ async def run_collection_preview(admin_chat_id, message_id, pair_id):
             # Fast scan of the last 1000 messages to estimate type distribution
             scan_limit = min(total_count, 1000)
             if scan_limit > 0:
-                async for m in userbot.iter_messages(source_chat, limit=scan_limit, reply_to=target_topic):
-                    m_type = get_specific_media_type(m.media)
-                    if m_type == "photo":
-                        photo_count += 1
-                    elif m_type == "video":
-                        video_count += 1
-                    elif m_type == "file":
-                        file_count += 1
-                    else:
-                        text_count += 1
+                try:
+                    async for m in userbot.iter_messages(source_chat, limit=scan_limit, reply_to=target_topic):
+                        m_type = get_specific_media_type(m.media)
+                        if m_type == "photo":
+                            photo_count += 1
+                        elif m_type == "video":
+                            video_count += 1
+                        elif m_type == "file":
+                            file_count += 1
+                        else:
+                            text_count += 1
+                except errors.FloodWaitError as fwe:
+                    logger.warning(f"⏳ PREVIEW RATE LIMIT: Hit {fwe.seconds}s wait. Using partial metrics.")
+                    if scan_limit <= 1: scan_limit = 100
                         
         # Scaling counts if total_count > 1000
         if total_count > 1000:
@@ -5875,7 +5879,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                     )
                 except Exception:
                     pass
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(2.5)
 
         if running_tasks.get(task_key):
             opts = collection_options.setdefault(task_key, {})
