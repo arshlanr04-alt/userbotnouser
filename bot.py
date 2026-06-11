@@ -4285,14 +4285,11 @@ def handle_callbacks(call):
             bot.answer_callback_query(call.id, f"Stopping {type_str}...")
         else:
             bot.answer_callback_query(call.id, "No active task found.")
-        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': call.id}))
-
-    elif data.startswith("pair_collect_"):
-        pid = int(data.split("_")[-1])
-        bot.answer_callback_query(call.id, "🔍 Scanning group/channel...")
-        asyncio.run_coroutine_threadsafe(run_collection_preview(call.message.chat.id, call.message.message_id, pid), loop)
+        asyncio.run_coroutine_threadsafe(show_pair_view(call.message.chat.id, call.message.message_id, pid), loop)
 
     elif data.startswith("pair_collect_confirm_"):
+        logger.warning(f"CALLBACK DATA = {data}")
+        logger.warning("PAIR_COLLECT_CONFIRM")
         # Format: pair_collect_confirm_{pair_id}
         pid = int(data.split("_")[-1])
         logger.info(f"COLLECT_CONFIRM CLICKED: {pid}")
@@ -4304,9 +4301,6 @@ def handle_callbacks(call):
                 bot.delete_message(chat_id, msg_id)
             except Exception as e:
                 logger.error(f"DELETE ERROR: {e}")
-            task_key = f"coll_{pair_id}"
-            if task_key in collection_options:
-                collection_options[task_key].clear()
             logger.info(f"CALLING run_collection({pair_id})")
             try:
                 await run_collection(chat_id, pair_id)
@@ -4321,11 +4315,20 @@ def handle_callbacks(call):
         asyncio.run_coroutine_threadsafe(transition_and_start(call.message.chat.id, call.message.message_id, pid), loop)
 
     elif data.startswith("pair_collect_cancel_"):
+        logger.warning(f"CALLBACK DATA = {data}")
+        logger.warning("PAIR_COLLECT_CANCEL")
         # Format: pair_collect_cancel_{pair_id}
         pid = int(data.split("_")[-1])
-        bot.answer_callback_query(call.id, "❌ Collection Canceled")
-        # Edit message back to pair view
-        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': call.id}))
+        bot.answer_callback_query(call.id, "❌ Collection Cancelled")
+        # Reopen pair view directly
+        asyncio.run_coroutine_threadsafe(show_pair_view(call.message.chat.id, call.message.message_id, pid), loop)
+
+    elif data.startswith("pair_collect_"):
+        logger.warning(f"CALLBACK DATA = {data}")
+        logger.warning("PAIR_COLLECT")
+        pid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id, "🔍 Scanning group/channel...")
+        asyncio.run_coroutine_threadsafe(run_collection_preview(call.message.chat.id, call.message.message_id, pid), loop)
 
     elif data.startswith("pair_coll_toggle_"):
         parts = data.split("_")
@@ -5312,17 +5315,18 @@ async def run_collection_preview(admin_chat_id, message_id, pair_id):
         file_count = 0
         text_count = 0
         
-        # We fetch up to 1000 messages or use limit/iter_messages to count types quickly
+        # We fetch up to 1000 messages or use limit/get_messages to count types quickly
         async with userbot_lock:
             # Let's get total count first
-            total_msg = await userbot.get_messages(source_chat, limit=0)
+            total_msg = await userbot.get_messages(source_chat, limit=0, reply_to=target_topic)
             total_count = total_msg.total
             
             # Fast scan of the last 1000 messages to estimate type distribution
             scan_limit = min(total_count, 1000)
             if scan_limit > 0:
                 try:
-                    async for m in userbot.iter_messages(source_chat, limit=scan_limit, reply_to=target_topic):
+                    messages = await userbot.get_messages(source_chat, limit=scan_limit, reply_to=target_topic)
+                    for m in messages:
                         m_type = get_specific_media_type(m.media)
                         if m_type == "photo":
                             photo_count += 1
@@ -5397,6 +5401,10 @@ async def run_collection_preview(admin_chat_id, message_id, pair_id):
             )
         except Exception as e:
             logger.error(f"Failed to edit preview message: {e}")
+            try:
+                bot.delete_message(admin_chat_id, message_id)
+            except Exception as del_err:
+                logger.error(f"Failed to delete old message during preview edit fallback: {del_err}")
             bot.send_message(admin_chat_id, preview_text, reply_markup=markup, parse_mode="HTML")
             
     except Exception as e:
@@ -5440,20 +5448,21 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         default_cf = "everything"
         
     # DIRECT ASSIGNMENT (Do not use .clear() to prevent reading empty dictionaries during async switches)
+    existing_opts = collection_options.get(task_key, {})
     collection_options[task_key] = {
-        "instant_release": bool(is_live),
-        "instant_filter": "everything",
-        "collect_filter": default_cf,
+        "instant_release": existing_opts.get("instant_release", bool(is_live)),
+        "instant_filter": existing_opts.get("instant_filter", "everything"),
+        "collect_filter": existing_opts.get("collect_filter", default_cf),
         "s_title": s_title,
-        "scanned": 0,
-        "collected": 0,
-        "duplicates": 0,
-        "deleted": 0,
-        "skipped": 0,
-        "filtered": 0,
+        "scanned": existing_opts.get("scanned", 0),
+        "collected": existing_opts.get("collected", 0),
+        "duplicates": existing_opts.get("duplicates", 0),
+        "deleted": existing_opts.get("deleted", 0),
+        "skipped": existing_opts.get("skipped", 0),
+        "filtered": existing_opts.get("filtered", 0),
         "limit": limit,
-        "sent_count": 0,
-        "progress": 0,
+        "sent_count": existing_opts.get("sent_count", 0),
+        "progress": existing_opts.get("progress", 0),
         "status": "Fetching"
     }
     
@@ -5481,7 +5490,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
         total_count = 0
         try:
             async with userbot_lock:
-                total_msg = await userbot.get_messages(source_chat, limit=0)
+                total_msg = await userbot.get_messages(source_chat, limit=0, reply_to=target_topic)
                 total_count = total_msg.total
         except Exception as e:
             logger.warning(f"Could not get total message count: {e}")
