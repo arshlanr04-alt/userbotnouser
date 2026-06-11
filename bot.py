@@ -58,6 +58,9 @@ topic_cache = {}
 login_data = {}    # { user_id: { state_data } }
 admin_states = {}  # { user_id: "current_state" }
 running_tasks = {} # { task_key: bool }
+collection_options = {} # Track collection options for active tasks
+history_options = {} # Track history scrape options
+vault_release_options = {} # Track vault release tasks
 
 # -----------------------------
 # DB (SQLite/PostgreSQL)
@@ -79,10 +82,20 @@ def db_conn():
                 USING_POSTGRES = True
             except (ImportError, Exception) as e:
                 logger.error(f"PostgreSQL connection failed: {e}. Falling back to SQLite.")
-                conn = sqlite3.connect(DB_PATH, timeout=30)
+                conn = sqlite3.connect(DB_PATH, timeout=60)
+                try:
+                    conn.execute("PRAGMA journal_mode=WAL;")
+                    conn.execute("PRAGMA synchronous=NORMAL;")
+                except Exception:
+                    pass
                 USING_POSTGRES = False
         else:
-            conn = sqlite3.connect(DB_PATH, timeout=30)
+            conn = sqlite3.connect(DB_PATH, timeout=60)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA synchronous=NORMAL;")
+            except Exception:
+                pass
             USING_POSTGRES = False
         
         yield conn
@@ -99,6 +112,7 @@ USING_POSTGRES = False
 # {grouped_id: [message_objects]}
 album_cache = {}
 album_processing_lock = set() # Track groups actively running pipeline execution
+media_semaphore = asyncio.Semaphore(2) # Limit concurrent download/upload operations
 
 # Deduplication cache for incoming message events
 processed_messages = set()
@@ -167,7 +181,9 @@ def get_placeholder(conn=None):
     return "?"
 
 def init_db():
+    logger.info(f"DATABASE_URL present: {bool(DATABASE_URL)}")
     with db_conn() as conn:
+        logger.info(f"USING_POSTGRES status: {USING_POSTGRES}")
         c = conn.cursor()
         c.execute("""
             CREATE TABLE IF NOT EXISTS settings (
@@ -1190,12 +1206,7 @@ userbot = None
 userbot_init_lock = asyncio.Lock()
 userbot_lock = asyncio.Lock()
 
-admin_states = {}
-login_data = {} # Temporary storage for login steps
-running_tasks = {} # Track long-running tasks for cancellation: { "hist_1": True, "coll_1": True }
-collection_options = {} # Track collection options for active tasks: { "coll_1": {"instant_release": False} }
-history_options = {} # Track history scrape options: { "hist_1": { ... } }
-vault_release_options = {} # Track vault release tasks: { "vault_rel_1_2": { ... } }
+# (State dictionaries declared globally at the top of the file)
 
 def get_active_tasks_report():
     active = [k for k, v in running_tasks.items() if v]
@@ -1841,21 +1852,11 @@ async def _start_userbot_unlocked():
             try: await userbot.disconnect()
             except Exception: pass
             
-        # Parse the string session credentials and convert to SQLiteSession
-        from telethon.sessions import StringSession, SQLiteSession
-        import os
-        
-        str_s = StringSession(session_string)
-        # Use a distinct on-disk SQLite session file
-        session_file = os.path.join(os.path.dirname(__file__), "userbot_session")
-        session = SQLiteSession(session_file)
-        # Apply the session string parameters (DC, IP, port, auth key) to the SQLiteSession
-        session.set_dc(str_s.dc_id, str_s.server_address, str_s.port)
-        session.auth_key = str_s.auth_key
-        session.save()
+        # Load the string session directly without converting to on-disk SQLiteSession
+        from telethon.sessions import StringSession
         
         userbot = TelegramClient(
-            session,
+            StringSession(session_string),
             int(api_id),
             api_hash,
             device_model="PC 64bit",
@@ -2190,12 +2191,21 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
 
                 # Fallback to copy/re-upload system
                 if not sent:
-                    sent = await client.send_message(
-                        entity=target_entity, 
-                        message=album_text, 
-                        file=file_to_send,
-                        reply_to=reply_header
-                    )
+                    if file_to_send:
+                        async with media_semaphore:
+                            sent = await client.send_message(
+                                entity=target_entity, 
+                                message=album_text, 
+                                file=file_to_send,
+                                reply_to=reply_header
+                            )
+                    else:
+                        sent = await client.send_message(
+                            entity=target_entity, 
+                            message=album_text, 
+                            file=file_to_send,
+                            reply_to=reply_header
+                        )
                     if sent:
                         first_id = sent[0].id if isinstance(sent, list) else sent.id
                         logger.info(f"✅ MIRROR: Sent via send_message to {tid} -> MSG ID: {first_id}")
@@ -2217,7 +2227,8 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                     for m in messages:
                         if m.media:
                             try:
-                                path = await client.download_media(m)
+                                async with media_semaphore:
+                                    path = await client.download_media(m)
                                 if path:
                                     downloaded_files.append(path)
                             except Exception as de:
@@ -2227,12 +2238,13 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                         file_to_send = downloaded_files if len(downloaded_files) > 1 else downloaded_files[0]
                         # Retry sending immediately in this attempt using the local file
                         try:
-                            sent = await client.send_message(
-                                entity=target_entity,
-                                message=album_text,
-                                file=file_to_send,
-                                reply_to=reply_header
-                            )
+                            async with media_semaphore:
+                                sent = await client.send_message(
+                                    entity=target_entity,
+                                    message=album_text,
+                                    file=file_to_send,
+                                    reply_to=reply_header
+                                )
                             if sent:
                                 first_id = sent[0].id if isinstance(sent, list) else sent.id
                                 logger.info(f"✅ MIRROR: Sent via fallback to {tid} -> MSG ID: {first_id}")
@@ -2384,14 +2396,16 @@ async def process_automation_pipeline(client, messages, source_chat_id):
         for msg in messages:
             if msg.media:
                 try:
-                    path = await client.download_media(msg)
+                    async with media_semaphore:
+                        path = await client.download_media(msg)
                     if path:
                         media_to_file[msg.id] = path
                 except errors.FloodWaitError as fwe:
                     logger.warning(f"⏳ PIPELINE FLOOD: Download limit hit. Sleeping {fwe.seconds}s...")
                     await asyncio.sleep(fwe.seconds)
                     try:
-                        path = await client.download_media(msg)
+                        async with media_semaphore:
+                            path = await client.download_media(msg)
                         if path: media_to_file[msg.id] = path
                     except Exception: pass
                 except Exception as e:
@@ -3221,7 +3235,7 @@ def cmd_extract_media(message):
             
         with db_conn() as conn:
             c = conn.cursor()
-            p = get_placeholder(conn)
+            p = get_placeholder()
             c.execute(f"SELECT file_id, media_type FROM media_logs WHERE source_message_id = {p} LIMIT 1", (smid,))
             res = c.fetchone()
         
@@ -4275,8 +4289,27 @@ def handle_callbacks(call):
 
     elif data.startswith("pair_collect_"):
         pid = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id, "🔍 Scanning group/channel...")
+        asyncio.run_coroutine_threadsafe(run_collection_preview(call.message.chat.id, call.message.message_id, pid), loop)
+
+    elif data.startswith("pair_collect_confirm_"):
+        # Format: pair_collect_confirm_{pair_id}
+        parts = data.split("_")
+        pid = int(parts[3])
         bot.answer_callback_query(call.id, "🚀 Starting Collection...")
+        try:
+            bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
         asyncio.run_coroutine_threadsafe(run_collection(call.message.chat.id, pid), loop)
+
+    elif data.startswith("pair_collect_cancel_"):
+        # Format: pair_collect_cancel_{pair_id}
+        parts = data.split("_")
+        pid = int(parts[3])
+        bot.answer_callback_query(call.id, "❌ Collection Canceled")
+        # Edit message back to pair view
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"pair_view_{pid}", 'message': call.message, 'id': call.id}))
 
     elif data.startswith("pair_coll_toggle_"):
         parts = data.split("_")
@@ -4945,7 +4978,8 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                     if msg.media:
                         try:
                             async with userbot_lock:
-                                path = await userbot.download_media(msg)
+                                async with media_semaphore:
+                                    path = await userbot.download_media(msg)
                             if path:
                                 media_to_file[msg.id] = path
                         except errors.FloodWaitError as fwe:
@@ -4954,7 +4988,8 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                                 await asyncio.sleep(fwe.seconds)
                                 try:
                                     async with userbot_lock:
-                                        path = await userbot.download_media(msg)
+                                        async with media_semaphore:
+                                            path = await userbot.download_media(msg)
                                     if path: media_to_file[msg.id] = path
                                 except Exception as e2:
                                     logger.error(f"Failed to download media after short flood wait: {e2}")
@@ -5220,6 +5255,146 @@ async def resolve_target_id(client: TelegramClient, target_ref):
             logger.error(f"iter_dialogs failed during resolution: {ex}")
 
     raise ValueError(f"Could not find or access chat: {target_ref}")
+
+async def run_collection_preview(admin_chat_id, message_id, pair_id):
+    is_ok, msg = await ensure_userbot()
+    if not is_ok:
+        bot.send_message(admin_chat_id, f"❌ Userbot error: {msg}")
+        return
+        
+    row = get_target_pair(pair_id)
+    if not row:
+        bot.send_message(admin_chat_id, "❌ Target pair not found.")
+        return
+        
+    pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf = row
+    
+    # Edit message to show Scanning status
+    try:
+        bot.edit_message_text(
+            f"🔍 <b>Scanning Group/Channel</b>\n\n<b>Source:</b> {s_title}\n\nPlease wait while we analyze the message statistics...",
+            admin_chat_id,
+            message_id,
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    try:
+        source_chat = await resolve_target_id(userbot, sid)
+        
+        target_topic = None
+        if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
+            try:
+                target_topic = int(s_topic)
+            except Exception:
+                pass
+
+        total_count = 0
+        photo_count = 0
+        video_count = 0
+        file_count = 0
+        text_count = 0
+        
+        # We fetch up to 1000 messages or use limit/iter_messages to count types quickly
+        async with userbot_lock:
+            # Let's get total count first
+            total_msg = await userbot.get_messages(source_chat, limit=0)
+            total_count = total_msg.total
+            
+            # Fast scan of the last 1000 messages to estimate type distribution
+            scan_limit = min(total_count, 1000)
+            if scan_limit > 0:
+                async for m in userbot.iter_messages(source_chat, limit=scan_limit, reply_to=target_topic):
+                    m_type = get_specific_media_type(m.media)
+                    if m_type == "photo":
+                        photo_count += 1
+                    elif m_type == "video":
+                        video_count += 1
+                    elif m_type == "file":
+                        file_count += 1
+                    else:
+                        text_count += 1
+                        
+        # Scaling counts if total_count > 1000
+        if total_count > 1000:
+            scale = total_count / 1000.0
+            est_photo = int(photo_count * scale)
+            est_video = int(video_count * scale)
+            est_file = int(file_count * scale)
+            est_text = int(text_count * scale)
+            desc_suffix = f"\n<i>(Distribution estimated based on a sample of 1,000 messages)</i>"
+        else:
+            est_photo = photo_count
+            est_video = video_count
+            est_file = file_count
+            est_text = text_count
+            desc_suffix = ""
+
+        # Estimates on duration: Telethon with semaphores has ~1-2 messages per second for media, text is faster.
+        # Let's assume an average speed of 3 messages/second for estimation.
+        est_seconds = int(total_count / 3) + 5
+        hours = est_seconds // 3600
+        minutes = (est_seconds % 3600) // 60
+        seconds = est_seconds % 60
+        
+        time_str = ""
+        if hours > 0:
+            time_str += f"{hours}h "
+        if minutes > 0 or hours > 0:
+            time_str += f"{minutes}m "
+        time_str += f"{seconds}s"
+
+        preview_text = (
+            f"📋 <b>Collection Preview & Scan Result</b>\n\n"
+            f"<b>Source Chat:</b> {s_title}\n"
+            f"<b>Target Chat:</b> {t_title}\n"
+            f"<b>Total Messages in Source:</b> {total_count}\n"
+            f"<b>Filter Configured:</b> {cf or 'everything'}\n"
+            f"<b>Estimated Duration:</b> ~{time_str}\n\n"
+            f"📊 <b>Estimated Content Breakdown:</b>\n"
+            f"🖼️ Photos: {est_photo}\n"
+            f"🎥 Videos: {est_video}\n"
+            f"📁 Files/Docs: {est_file}\n"
+            f"📝 Text Only: {est_text}\n"
+            f"{desc_suffix}\n\n"
+            f"Would you like to start the collection process?"
+        )
+        
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("🚀 Start Collection", callback_data=f"pair_collect_confirm_{pair_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"pair_collect_cancel_{pair_id}")
+        )
+        
+        try:
+            bot.edit_message_text(
+                preview_text,
+                admin_chat_id,
+                message_id,
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Failed to edit preview message: {e}")
+            bot.send_message(admin_chat_id, preview_text, reply_markup=markup, parse_mode="HTML")
+            
+    except Exception as e:
+        logger.error(f"Scan failed: {e}")
+        # fallback to starting collection directly or showing error
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("🔙 Back to Pair", callback_data=f"pair_view_{pair_id}"))
+        try:
+            bot.edit_message_text(
+                f"❌ <b>Scan Failed</b>\n\nAn error occurred while scanning: {e}\n\nYou can try again or check userbot connection.",
+                admin_chat_id,
+                message_id,
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+
 async def run_collection(admin_chat_id, pair_id, limit=None):
     is_ok, msg = await ensure_userbot()
     if not is_ok:
@@ -5427,7 +5602,8 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                             if msg.media:
                                 try:
                                     async with userbot_lock:
-                                        path = await userbot.download_media(msg)
+                                        async with media_semaphore:
+                                            path = await userbot.download_media(msg)
                                     if path:
                                         media_to_file[msg.id] = path
                                 except errors.FloodWaitError as fwe:
@@ -5436,7 +5612,8 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                         await asyncio.sleep(fwe.seconds)
                                         try:
                                             async with userbot_lock:
-                                                path = await userbot.download_media(msg)
+                                                async with media_semaphore:
+                                                    path = await userbot.download_media(msg)
                                             if path: media_to_file[msg.id] = path
                                         except Exception as e2:
                                             logger.error(f"Failed to download media after short flood wait: {e2}")
@@ -6256,7 +6433,7 @@ class LogBotManager:
                 fetch_id = args[1]
                 with db_conn() as conn:
                     c = conn.cursor()
-                    p = get_placeholder(conn)
+                    p = get_placeholder()
                     try:
                         f_id_val = int(fetch_id)
                     except ValueError:
@@ -6284,7 +6461,7 @@ class LogBotManager:
                 if count > 30: count = 30 
                 with db_conn() as conn:
                     c = conn.cursor()
-                    p = get_placeholder(conn)
+                    p = get_placeholder()
                     c.execute(f"SELECT file_id, media_type, caption, log_msg_id FROM log_media WHERE bot_id = {p} ORDER BY timestamp DESC LIMIT {p}", (bot_id, count))
                     results = c.fetchall()
                 if not results:
@@ -6304,7 +6481,7 @@ class LogBotManager:
             if message.from_user.id != ADMIN_ID: return
             with db_conn() as conn:
                 c = conn.cursor()
-                p = get_placeholder(conn)
+                p = get_placeholder()
                 c.execute(f"""
                     SELECT m.source_chat_id, p.source_title, COUNT(m.id)
                     FROM log_media m
@@ -6331,7 +6508,7 @@ class LogBotManager:
                 group_id, count = int(args[1]), (int(args[2]) if len(args) > 2 else 5)
                 with db_conn() as conn:
                     c = conn.cursor()
-                    p = get_placeholder(conn)
+                    p = get_placeholder()
                     c.execute(f"SELECT file_id, media_type, caption, log_msg_id FROM log_media WHERE source_chat_id = {p} AND bot_id = {p} ORDER BY timestamp DESC LIMIT {p}", (group_id, bot_id, count))
                     results = c.fetchall()
                 for f_id, m_t, cap, l_id in reversed(results):
@@ -6344,7 +6521,7 @@ class LogBotManager:
             sid = int(call.data.split("_")[-1])
             with db_conn() as conn:
                 c = conn.cursor()
-                p = get_placeholder(conn)
+                p = get_placeholder()
                 
                 c.execute(f"SELECT source_title FROM target_pairs WHERE source_id = {p} LIMIT 1", (sid,))
                 res = c.fetchone()
