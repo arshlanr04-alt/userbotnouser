@@ -4297,11 +4297,18 @@ def handle_callbacks(call):
         parts = data.split("_")
         pid = int(parts[3])
         bot.answer_callback_query(call.id, "🚀 Starting Collection...")
-        try:
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-        except Exception:
-            pass
-        asyncio.run_coroutine_threadsafe(run_collection(call.message.chat.id, pid), loop)
+        
+        async def transition_and_start(chat_id, msg_id, pair_id):
+            try:
+                bot.delete_message(chat_id, msg_id)
+            except Exception:
+                pass
+            task_key = f"coll_{pair_id}"
+            if task_key in collection_options:
+                collection_options[task_key].clear()
+            await run_collection(chat_id, pair_id)
+            
+        asyncio.run_coroutine_threadsafe(transition_and_start(call.message.chat.id, call.message.message_id, pid), loop)
 
     elif data.startswith("pair_collect_cancel_"):
         # Format: pair_collect_cancel_{pair_id}
@@ -5404,6 +5411,9 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
     task_key = f"coll_{pair_id}"
     running_tasks[task_key] = True
     
+    if task_key in collection_options:
+        collection_options[task_key].clear()
+        
     row = get_target_pair(pair_id)
     if not row: return
     pid, sid, tid, s_title, t_title, is_mon, is_live, is_mir, s_topic, t_topic, cf = row
