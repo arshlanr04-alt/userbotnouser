@@ -5331,7 +5331,7 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                 chunk = await userbot.get_messages(
                     target_chat,
                     limit=chunk_size,
-                    offset_id=offset_id,
+                    min_id=offset_id,
                     reply_to=target_topic,
                     reverse=True
                 )
@@ -5977,7 +5977,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 chunk = await userbot.get_messages(
                     source_chat,
                     limit=cur_limit,
-                    offset_id=offset_id,
+                    min_id=offset_id,
                     reply_to=target_topic,
                     reverse=True
                 )
