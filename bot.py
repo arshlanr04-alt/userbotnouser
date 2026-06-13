@@ -2664,52 +2664,84 @@ def setup_automation_handlers(client: TelegramClient):
 
     processed_reactions_cache = []
 
-    @client.on(events.Raw(types.UpdateMessageReactions))
+    @client.on(events.Raw)
     async def reaction_handler(event):
-        try:
-            peer_id = client.get_peer_id(event.peer)
-        except Exception:
+        msg = None
+        peer_id = None
+        msg_id = None
+        
+        if isinstance(event, types.UpdateMessageReactions):
+            try:
+                peer_id = client.get_peer_id(event.peer)
+                msg_id = event.msg_id
+            except Exception:
+                return
+        elif isinstance(event, (types.UpdateEditMessage, types.UpdateEditChannelMessage)):
+            try:
+                msg = event.message
+                if not msg:
+                    return
+                peer_id = client.get_peer_id(msg.peer_id)
+                msg_id = msg.id
+            except Exception:
+                return
+        else:
             return
             
-        cache_key = (peer_id, event.msg_id)
+        logger.warning(f"📢 Reaction raw event received: type={type(event).__name__}, msg_id={msg_id}, peer_id={peer_id}")
+        
+        cache_key = (peer_id, msg_id)
         if cache_key in processed_reactions_cache:
             return
             
         if not hasattr(client, '_me') or not client._me:
             try:
                 client._me = await client.get_me()
-            except Exception:
+            except Exception as e:
+                logger.error(f"Failed to get_me for reaction handler: {e}")
                 return
                 
         me = getattr(client, '_me', None)
         if not me:
             return
             
-        try:
-            async with userbot_lock:
-                msg = await client.get_messages(event.peer, ids=event.msg_id)
-        except Exception:
-            return
-            
         if not msg:
+            try:
+                logger.warning(f"Fetching message details for reaction msg_id={msg_id} in peer_id={peer_id}")
+                entity = await client.get_entity(peer_id)
+                async with userbot_lock:
+                    msgs = await client.get_messages(entity, ids=msg_id)
+                if isinstance(msgs, list):
+                    msg = msgs[0] if msgs else None
+                else:
+                    msg = msgs
+            except Exception as e:
+                logger.error(f"Failed to fetch message for reaction: {e}")
+                return
+                
+        if not msg or not msg.reactions:
+            logger.warning("No reactions on fetched message.")
             return
             
         has_userbot_reacted = False
-        if msg.reactions and msg.reactions.results:
+        if msg.reactions.results:
             for r in msg.reactions.results:
                 if getattr(r, 'chosen_order', None) is not None:
                     has_userbot_reacted = True
                     break
                     
-        if not has_userbot_reacted and msg.reactions and msg.reactions.recent_reactions:
+        if not has_userbot_reacted and msg.reactions.recent_reactions:
             for rr in msg.reactions.recent_reactions:
                 if isinstance(rr.peer_id, types.PeerUser) and rr.peer_id.user_id == me.id:
                     has_userbot_reacted = True
                     break
                     
         if not has_userbot_reacted:
+            logger.warning("Userbot reaction not found in message reactions.")
             return
             
+        logger.warning(f"Userbot reaction detected on message {msg_id}! Forwarding/downloading...")
+        
         processed_reactions_cache.append(cache_key)
         if len(processed_reactions_cache) > 1000:
             processed_reactions_cache.pop(0)
@@ -2725,7 +2757,7 @@ def setup_automation_handlers(client: TelegramClient):
             is_restricted = False
             
         if is_restricted:
-            logger.info(f"Reacted message in restricted chat {peer_id}. Downloading media locally.")
+            logger.warning(f"Source chat {peer_id} is restricted. Downloading media locally...")
             temp_path = await client.download_media(msg)
             for target in targets:
                 try:
@@ -2739,6 +2771,7 @@ def setup_automation_handlers(client: TelegramClient):
                 try: os.remove(temp_path)
                 except Exception: pass
         else:
+            logger.warning(f"Source chat {peer_id} is unrestricted. Forwarding natively...")
             for target in targets:
                 try:
                     await client.forward_messages(target, msg)
