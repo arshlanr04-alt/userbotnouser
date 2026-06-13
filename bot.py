@@ -2810,26 +2810,51 @@ def setup_automation_handlers(client: TelegramClient):
             is_restricted = getattr(chat_peer, 'noforwards', False)
         except Exception:
             is_restricted = False
-            
+
+        album_msgs = [msg]
+        if msg.grouped_id is not None:
+            try:
+                entity = await client.get_entity(peer_id)
+                msg_ids = list(range(max(1, msg_id - 10), msg_id + 11))
+                async with userbot_lock:
+                    siblings = await client.get_messages(entity, ids=msg_ids)
+                album_msgs = [m for m in siblings if m and m.grouped_id == msg.grouped_id]
+                album_msgs.sort(key=lambda x: x.id)
+                if not album_msgs:
+                    album_msgs = [msg]
+            except Exception as e:
+                logger.error(f"Failed to fetch album siblings for msg_id={msg_id}: {e}")
+                album_msgs = [msg]
+
         if is_restricted:
             logger.warning(f"Source chat {peer_id} is restricted. Downloading media locally...")
-            temp_path = await client.download_media(msg)
+            temp_paths = []
+            album_text = next((m.message for m in album_msgs if m.message), "")
+            for m in album_msgs:
+                if m.media:
+                    try:
+                        path = await client.download_media(m)
+                        if path:
+                            temp_paths.append(path)
+                    except Exception as e:
+                        logger.error(f"Failed to download media for msg_id={m.id}: {e}")
             for target in targets:
                 try:
-                    if temp_path:
-                        await client.send_message(target, file=temp_path, message=msg.message or "")
-                    elif msg.message:
-                        await client.send_message(target, msg.message)
+                    if temp_paths:
+                        await client.send_file(target, file=temp_paths, caption=album_text)
+                    elif album_text:
+                        await client.send_message(target, album_text)
                 except Exception as e:
                     logger.error(f"Failed to send reacted message to target {target}: {e}")
-            if temp_path and os.path.exists(temp_path):
-                try: os.remove(temp_path)
-                except Exception: pass
+            for temp_path in temp_paths:
+                if temp_path and os.path.exists(temp_path):
+                    try: os.remove(temp_path)
+                    except Exception: pass
         else:
             logger.warning(f"Source chat {peer_id} is unrestricted. Forwarding natively...")
             for target in targets:
                 try:
-                    await client.forward_messages(target, msg)
+                    await client.forward_messages(target, album_msgs)
                 except Exception as e:
                     logger.error(f"Failed to forward reacted message to target {target}: {e}")
 
