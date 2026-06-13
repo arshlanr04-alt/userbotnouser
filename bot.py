@@ -2574,11 +2574,176 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                 try: os.remove(temp_path)
                 except Exception: pass
 
+def parse_telegram_message_link(text):
+    import re
+    text = text.strip()
+    # Private message link: t.me/c/123456789/4567
+    m = re.search(r'(?:t\.me|telegram\.me)/c/(\d+)/(\d+)', text)
+    if m:
+        chat_id = int(f"-100{m.group(1)}")
+        msg_id = int(m.group(2))
+        return {"type": "private", "chat_id": chat_id, "message_id": msg_id}
+    # Public message link: t.me/username/4567
+    m = re.search(r'(?:t\.me|telegram\.me)/([a-zA-Z0-9_]{5,})/(\d+)', text)
+    if m:
+        username = m.group(1)
+        msg_id = int(m.group(2))
+        return {"type": "public", "username": username, "message_id": msg_id}
+    return None
+
+async def process_and_send_message_link(client: TelegramClient, link_info, sender_id):
+    try:
+        if link_info["type"] == "private":
+            chat_ref = link_info["chat_id"]
+        else:
+            chat_ref = link_info["username"]
+            
+        try:
+            chat = await resolve_target_id(client, chat_ref)
+        except Exception as e:
+            if link_info["type"] == "public":
+                try:
+                    from telethon.tl.functions.channels import JoinChannelRequest
+                    chat = await client.get_entity(chat_ref)
+                    await client(JoinChannelRequest(chat))
+                except Exception as join_err:
+                    logger.error(f"Auto-join failed for {chat_ref}: {join_err}")
+                    raise e
+            else:
+                raise e
+                
+        msg_id = link_info["message_id"]
+        
+        async with userbot_lock:
+            msgs = await client.get_messages(chat, ids=msg_id)
+            
+        if not msgs:
+            logger.error(f"Message ID {msg_id} not found in chat {chat_ref}")
+            return False, "Message not found in the chat."
+            
+        me = await client.get_me()
+        targets = [me.id]
+        if sender_id and sender_id != me.id:
+            targets.append(sender_id)
+            
+        is_restricted = getattr(chat, 'noforwards', False)
+        
+        if is_restricted:
+            logger.info(f"Chat {chat_ref} is restricted. Downloading media locally.")
+            temp_path = await client.download_media(msgs)
+            
+            for target in targets:
+                try:
+                    if temp_path:
+                        await client.send_message(target, file=temp_path, message=msgs.message or "")
+                    elif msgs.message:
+                        await client.send_message(target, msgs.message)
+                except Exception as e:
+                    logger.error(f"Failed to send restricted media to target {target}: {e}")
+                    
+            if temp_path and os.path.exists(temp_path):
+                try: os.remove(temp_path)
+                except Exception: pass
+        else:
+            for target in targets:
+                try:
+                    await client.forward_messages(target, msgs)
+                except Exception as e:
+                    logger.error(f"Failed to forward message to target {target}: {e}")
+                    
+        return True, "Success"
+    except Exception as e:
+        logger.error(f"Error processing message link: {e}")
+        return False, str(e)
+
 def setup_automation_handlers(client: TelegramClient):
     if getattr(client, '_automation_handlers_registered', False):
         logger.info("Automation handlers already registered on this client. Skipping.")
         return
     client._automation_handlers_registered = True
+
+    processed_reactions_cache = []
+
+    @client.on(events.Raw(types.UpdateMessageReactions))
+    async def reaction_handler(event):
+        try:
+            peer_id = client.get_peer_id(event.peer)
+        except Exception:
+            return
+            
+        cache_key = (peer_id, event.msg_id)
+        if cache_key in processed_reactions_cache:
+            return
+            
+        if not hasattr(client, '_me') or not client._me:
+            try:
+                client._me = await client.get_me()
+            except Exception:
+                return
+                
+        me = getattr(client, '_me', None)
+        if not me:
+            return
+            
+        try:
+            async with userbot_lock:
+                msg = await client.get_messages(event.peer, ids=event.msg_id)
+        except Exception:
+            return
+            
+        if not msg:
+            return
+            
+        has_userbot_reacted = False
+        if msg.reactions and msg.reactions.results:
+            for r in msg.reactions.results:
+                if getattr(r, 'chosen_order', None) is not None:
+                    has_userbot_reacted = True
+                    break
+                    
+        if not has_userbot_reacted and msg.reactions and msg.reactions.recent_reactions:
+            for rr in msg.reactions.recent_reactions:
+                if isinstance(rr.peer_id, types.PeerUser) and rr.peer_id.user_id == me.id:
+                    has_userbot_reacted = True
+                    break
+                    
+        if not has_userbot_reacted:
+            return
+            
+        processed_reactions_cache.append(cache_key)
+        if len(processed_reactions_cache) > 1000:
+            processed_reactions_cache.pop(0)
+            
+        targets = [me.id]
+        if ADMIN_ID and ADMIN_ID != me.id:
+            targets.append(ADMIN_ID)
+            
+        try:
+            chat_peer = await resolve_target_id(client, peer_id)
+            is_restricted = getattr(chat_peer, 'noforwards', False)
+        except Exception:
+            is_restricted = False
+            
+        if is_restricted:
+            logger.info(f"Reacted message in restricted chat {peer_id}. Downloading media locally.")
+            temp_path = await client.download_media(msg)
+            for target in targets:
+                try:
+                    if temp_path:
+                        await client.send_message(target, file=temp_path, message=msg.message or "")
+                    elif msg.message:
+                        await client.send_message(target, msg.message)
+                except Exception as e:
+                    logger.error(f"Failed to send reacted message to target {target}: {e}")
+            if temp_path and os.path.exists(temp_path):
+                try: os.remove(temp_path)
+                except Exception: pass
+        else:
+            for target in targets:
+                try:
+                    await client.forward_messages(target, msg)
+                except Exception as e:
+                    logger.error(f"Failed to forward reacted message to target {target}: {e}")
 
     @client.on(events.NewMessage)
     async def auto_handler(event):
@@ -2602,6 +2767,22 @@ def setup_automation_handlers(client: TelegramClient):
                 logger.error(f"Failed to get_me() for userbot: {e}")
 
         me = getattr(client, '_me', None)
+
+        # Message Link Auto-Downloader/Forwarder System
+        is_primary_admin = (m.sender_id == ADMIN_ID) or (me and m.sender_id == me.id)
+        is_manager = is_primary_admin or is_authorized_manager(m.sender_id)
+        if event.is_private and is_manager and m.text:
+            link_info = parse_telegram_message_link(m.text)
+            if link_info:
+                async def handle_link():
+                    await event.reply("⏳ **Processing message link...**")
+                    success, err = await process_and_send_message_link(client, link_info, m.sender_id)
+                    if success:
+                        await event.reply("✅ **Message successfully processed and delivered!**")
+                    else:
+                        await event.reply(f"❌ **Failed to process link:** {err}")
+                asyncio.create_task(handle_link())
+                return
 
         # Private Media Forwarding System
         if event.is_private and m.media:
