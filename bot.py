@@ -1511,9 +1511,48 @@ def get_pm_fwd_markup():
         InlineKeyboardButton(toggle_label, callback_data="pm_fwd_toggle"),
         InlineKeyboardButton(dest_btn_label, callback_data="pm_fwd_toggle_destructive"),
         InlineKeyboardButton("➕ Add Target Chat", callback_data="pm_fwd_add_target"),
-        InlineKeyboardButton("🗑 Clear All Targets", callback_data="pm_fwd_clear_targets")
+        InlineKeyboardButton("🗑 Clear All Targets", callback_data="pm_fwd_clear_targets"),
+        InlineKeyboardButton("💬 Private Chat Monitor Settings", callback_data="pm_mon_settings")
     )
     markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
+    return markup
+
+def get_pm_mon_text():
+    enabled = get_setting("pm_chat_monitoring_enabled") == "1"
+    status_emoji = "🟢 ENABLED" if enabled else "🔴 DISABLED"
+    dest_id = get_setting("pm_chat_monitoring_destination")
+    
+    dest_label = "_Not Set_"
+    if dest_id:
+        title = None
+        try:
+            with db_conn() as conn:
+                c = conn.cursor()
+                p = get_placeholder()
+                c.execute(f"SELECT target_title FROM target_pairs WHERE target_id = {p} LIMIT 1", (int(dest_id),))
+                row = c.fetchone()
+                if row:
+                    title = row[0]
+        except Exception:
+            pass
+        dest_label = title if title else f"`{dest_id}`"
+        
+    text = f"💬 *PRIVATE CHAT MONITOR*\n\n"
+    text += f"Status: `{status_emoji}`\n"
+    text += f"Destination Chat: {dest_label}\n\n"
+    text += "When active, any text messages or media received by the userbot account in private chats (from non-manager users) will be automatically forwarded to the destination chat.\n"
+    return text
+
+def get_pm_mon_markup():
+    markup = InlineKeyboardMarkup(row_width=1)
+    enabled = get_setting("pm_chat_monitoring_enabled") == "1"
+    toggle_label = "🔴 Disable Monitor" if enabled else "🟢 Enable Monitor"
+    
+    markup.add(
+        InlineKeyboardButton(toggle_label, callback_data="pm_mon_toggle"),
+        InlineKeyboardButton("🎯 Set Destination Chat", callback_data="pm_mon_set_dest")
+    )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="pm_fwd_main"))
     return markup
 
 def pairs_list_markup():
@@ -2833,6 +2872,51 @@ def setup_automation_handlers(client: TelegramClient):
                 asyncio.create_task(handle_link())
                 return
 
+        # Private Chat Monitor System
+        if event.is_private and not is_manager and me and m.sender_id != me.id:
+            pm_mon_enabled = get_setting("pm_chat_monitoring_enabled") == "1"
+            dest_id = get_setting("pm_chat_monitoring_destination")
+            if pm_mon_enabled and dest_id:
+                async def run_pm_monitor():
+                    try:
+                        target = await resolve_target_id(client, int(dest_id))
+                        sender = await event.get_sender()
+                        sender_name = getattr(sender, 'first_name', '') or ''
+                        if getattr(sender, 'last_name', None):
+                            sender_name += f" {sender.last_name}"
+                        if not sender_name:
+                            sender_name = "User"
+                        username = getattr(sender, 'username', '')
+                        username_str = f" (@{username})" if username else ""
+                        
+                        header = f"💬 **Monitored PM Message**\n"
+                        header += f"👤 **Sender:** [{sender_name}](tg://user?id={m.sender_id}) (`{m.sender_id}`){username_str}"
+                        
+                        await client.send_message(target, header, parse_mode="Markdown")
+                        
+                        ttl = getattr(m, 'ttl_seconds', None) or getattr(m.media, 'ttl_seconds', None)
+                        is_destructive = ttl and (ttl > 0)
+                        if is_destructive:
+                            temp_path = await client.download_media(m)
+                            if temp_path:
+                                await client.send_message(target, file=temp_path, message=m.message or "")
+                                if os.path.exists(temp_path):
+                                    os.remove(temp_path)
+                        else:
+                            try:
+                                await client.forward_messages(target, m)
+                            except Exception:
+                                temp_path = await client.download_media(m)
+                                if temp_path:
+                                    await client.send_message(target, file=temp_path, message=m.message or "")
+                                    if os.path.exists(temp_path):
+                                        os.remove(temp_path)
+                                elif m.message:
+                                    await client.send_message(target, m.message)
+                    except Exception as mon_err:
+                        logger.error(f"Failed to execute PM monitoring for sender {m.sender_id}: {mon_err}")
+                asyncio.create_task(run_pm_monitor())
+
         # Private Media Forwarding System
         if event.is_private and m.media:
             is_me = me and (m.sender_id == me.id)
@@ -3966,6 +4050,40 @@ def handle_callbacks(call):
                 bot.answer_callback_query(call.id, "Target already added.")
             
             bot.edit_message_text(get_pm_fwd_text(), call.message.chat.id, call.message.message_id, reply_markup=get_pm_fwd_markup(), parse_mode="Markdown")
+
+    elif data == "pm_mon_settings":
+        bot.answer_callback_query(call.id)
+        bot.edit_message_text(get_pm_mon_text(), call.message.chat.id, call.message.message_id, reply_markup=get_pm_mon_markup(), parse_mode="Markdown")
+
+    elif data == "pm_mon_toggle":
+        enabled = get_setting("pm_chat_monitoring_enabled") == "1"
+        new_state = "0" if enabled else "1"
+        set_setting("pm_chat_monitoring_enabled", new_state)
+        bot.answer_callback_query(call.id, "Monitor Enabled" if new_state == "1" else "Monitor Disabled")
+        bot.edit_message_text(get_pm_mon_text(), call.message.chat.id, call.message.message_id, reply_markup=get_pm_mon_markup(), parse_mode="Markdown")
+
+    elif data == "pm_mon_set_dest":
+        bot.answer_callback_query(call.id)
+        async def show_pm_mon_tgt():
+            markup = await get_chat_selection_markup("pm_mon_tgt", 0)
+            bot.edit_message_text("🎯 *Select Destination Chat*\nChoose the group or channel to send private chat logs to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        asyncio.run_coroutine_threadsafe(show_pm_mon_tgt(), loop)
+
+    elif data.startswith("pm_mon_tgt_"):
+        bot.answer_callback_query(call.id)
+        parts = data.split("_")
+        if parts[3] == "page":
+            page = int(parts[4])
+            async def update_pm_mon_tgt():
+                markup = await get_chat_selection_markup("pm_mon_tgt", page)
+                if markup:
+                    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+            asyncio.run_coroutine_threadsafe(update_pm_mon_tgt(), loop)
+        else:
+            tid = int(parts[3])
+            set_setting("pm_chat_monitoring_destination", str(tid))
+            bot.answer_callback_query(call.id, "Destination set!")
+            bot.edit_message_text(get_pm_mon_text(), call.message.chat.id, call.message.message_id, reply_markup=get_pm_mon_markup(), parse_mode="Markdown")
 
     elif data.startswith("sel_search|"):
         bot.answer_callback_query(call.id)
