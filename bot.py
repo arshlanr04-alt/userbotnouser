@@ -2673,6 +2673,8 @@ def setup_automation_handlers(client: TelegramClient):
         if isinstance(event, types.UpdateMessageReactions):
             try:
                 peer_id = client.get_peer_id(event.peer)
+                if asyncio.iscoroutine(peer_id):
+                    peer_id = await peer_id
                 msg_id = event.msg_id
             except Exception:
                 return
@@ -2682,6 +2684,8 @@ def setup_automation_handlers(client: TelegramClient):
                 if not msg:
                     return
                 peer_id = client.get_peer_id(msg.peer_id)
+                if asyncio.iscoroutine(peer_id):
+                    peer_id = await peer_id
                 msg_id = msg.id
             except Exception:
                 return
