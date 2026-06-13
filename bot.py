@@ -1648,9 +1648,13 @@ async def get_topic_selection_markup(chat_id, prefix):
         
         if not topics:
             markup.add(InlineKeyboardButton("⚠️ No Topics Found", callback_data="noop"))
+            if prefix == "sel_src_topic":
+                markup.add(InlineKeyboardButton("➕ Create Topic", callback_data=f"create_topic_prompt_{chat_id}"))
             # Even if no topics found, allow selecting the whole group
             markup.add(InlineKeyboardButton("🏢 Select Entire Group", callback_data=f"{prefix}_{chat_id}_0"))
         else:
+            if prefix == "sel_src_topic":
+                markup.add(InlineKeyboardButton("➕ Create Topic", callback_data=f"create_topic_prompt_{chat_id}"))
             # Add option to select the entire group as a source/target
             markup.add(InlineKeyboardButton("🏢 Select Entire Group", callback_data=f"{prefix}_{chat_id}_0"))
             for topic in topics:
@@ -2751,8 +2755,16 @@ def setup_automation_handlers(client: TelegramClient):
             processed_reactions_cache.pop(0)
             
         targets = [me.id]
-        if ADMIN_ID and ADMIN_ID != me.id:
-            targets.append(ADMIN_ID)
+        try:
+            with db_conn() as conn:
+                c = conn.cursor()
+                c.execute("SELECT user_id FROM managers")
+                for row in c.fetchall():
+                    m_id = row[0]
+                    if m_id and m_id != me.id and m_id not in targets:
+                        targets.append(m_id)
+        except Exception as db_err:
+            logger.error(f"Failed to fetch managers from DB: {db_err}")
             
         try:
             chat_peer = await resolve_target_id(client, peer_id)
@@ -4324,6 +4336,12 @@ def handle_callbacks(call):
                 bot.edit_message_text("🎯 *Select Target Chat*\nChoose the group or channel to send to:", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
             asyncio.run_coroutine_threadsafe(show_tgt(), loop)
 
+    elif data.startswith("create_topic_prompt_"):
+        bot.answer_callback_query(call.id)
+        chat_id = int(data.replace("create_topic_prompt_", ""))
+        admin_states[uid] = f"awaiting_new_topic_name_{chat_id}"
+        bot.send_message(call.message.chat.id, "➕ *Create New Topic*\n\nPlease send the *Name* of the topic you want to create in the source group:")
+
     elif data.startswith("sel_src_"):
         bot.answer_callback_query(call.id)
         parts = data.split("_")
@@ -4914,6 +4932,72 @@ def handle_state_inputs(message):
         admin_states.pop(uid, None)
         bot.reply_to(message, f"✅ *User Banned:* `{target}`\nTheir messages will no longer be processed.", parse_mode="Markdown")
         bot.send_message(message.chat.id, "🚫 *Banned Users*", reply_markup=banlist_markup(), parse_mode="Markdown")
+
+    elif state.startswith("awaiting_new_topic_name_"):
+        chat_id = int(state.replace("awaiting_new_topic_name_", ""))
+        topic_title = text
+        admin_states.pop(uid, None)
+        
+        bot.send_message(message.chat.id, f"⏳ **Creating topic '{topic_title}' in source group...**")
+        
+        async def create_and_select():
+            try:
+                from telethon.tl.functions.channels import CreateForumTopicRequest
+                entity = await resolve_target_id(userbot, chat_id)
+                result = await userbot(CreateForumTopicRequest(
+                    channel=entity,
+                    title=topic_title
+                ))
+                
+                topic_id = None
+                if hasattr(result, 'updates'):
+                    for u in result.updates:
+                        if hasattr(u, 'message') and u.message:
+                            topic_id = u.message.id
+                            break
+                            
+                if not topic_id and hasattr(result, 'updates'):
+                    from telethon.tl.types import UpdateMessageID
+                    for u in result.updates:
+                        if isinstance(u, UpdateMessageID):
+                            topic_id = u.id
+                            break
+                            
+                if not topic_id:
+                    bot.send_message(message.chat.id, "❌ **Failed to retrieve created topic ID.** Please select manually.")
+                    return
+                    
+                if uid not in login_data:
+                    login_data[uid] = {}
+                login_data[uid]["source_id"] = chat_id
+                login_data[uid]["source_topic_id"] = topic_id
+                
+                bot.send_message(message.chat.id, f"✅ **Topic '{topic_title}' Created and Selected!** (ID: `{topic_id}`)")
+                
+                if login_data[uid].get("preselected_flow") == "target":
+                    tid = login_data[uid]["target_id"]
+                    ttid = login_data[uid]["target_topic_id"]
+                    t_chat = await resolve_target_id(userbot, tid)
+                    s_title = getattr(entity, 'title', None) or getattr(entity, 'first_name', None) or str(chat_id)
+                    t_title = getattr(t_chat, 'title', None) or getattr(t_chat, 'first_name', None) or str(tid)
+                    
+                    add_target_pair(chat_id, topic_id, tid, ttid, s_title, t_title)
+                    
+                    success_text = f"✅ *Pair Added!*\n\n"
+                    success_text += f"Source: `{s_title}` (Topic: `{topic_id}`)\n"
+                    success_text += f"Target: `{t_title}`" + (f" (Topic: `{ttid}`)" if ttid else "")
+                    
+                    bot.send_message(message.chat.id, success_text, parse_mode="Markdown")
+                    bot.send_message(message.chat.id, "🎯 *Target Pairs*", reply_markup=pairs_list_markup())
+                    login_data.pop(uid, None)
+                else:
+                    markup = await get_chat_selection_markup("sel_tgt", 0)
+                    bot.send_message(message.chat.id, "🎯 *Select Target Chat*\nChoose the group or channel to send to:", reply_markup=markup, parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Error creating topic: {e}")
+                bot.send_message(message.chat.id, f"❌ **Failed to create topic:** {e}\n(Make sure the userbot is admin with 'Manage Topics' permission)")
+                
+        asyncio.run_coroutine_threadsafe(create_and_select(), loop)
 
     # --- Logging System ---
     # --- Log Bot System ---
