@@ -2965,7 +2965,7 @@ def setup_automation_handlers(client: TelegramClient):
                                 if temp_path:
                                     for tid in target_ids:
                                         try:
-                                            tgt_peer = await client.get_input_entity(int(tid))
+                                            tgt_peer = await resolve_target_id(client, int(tid))
                                             await client.send_message(
                                                 entity=tgt_peer,
                                                 file=temp_path,
@@ -2986,7 +2986,7 @@ def setup_automation_handlers(client: TelegramClient):
                         # Normal media: standard forward directly
                         for tid in target_ids:
                             try:
-                                tgt_peer = await client.get_input_entity(int(tid))
+                                tgt_peer = await resolve_target_id(client, int(tid))
                                 await client.forward_messages(
                                     entity=tgt_peer,
                                     messages=m,
