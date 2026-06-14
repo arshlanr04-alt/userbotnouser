@@ -5342,6 +5342,9 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
             for m in chunk:
                 scanned += 1
                 
+                if isinstance(m, types.MessageService):
+                    continue
+                
                 if start_date and m.date < start_date:
                     continue
                 if end_date and m.date > end_date:
@@ -5990,6 +5993,11 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                 scanned += 1
                 progress = int((scanned / total_to_fetch) * 100)
                 if progress > 100: progress = 100
+                
+                if isinstance(m, types.MessageService):
+                    opts["filtered"] += 1
+                    opts.update({"scanned": scanned, "progress": progress})
+                    continue
                 
                 sender_id = m.sender_id
                 sender_username = getattr(m.sender, 'username', None)
