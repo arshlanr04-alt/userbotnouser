@@ -358,6 +358,19 @@ def init_db():
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS userbot_sessions (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT UNIQUE,
+                    api_id INTEGER,
+                    api_hash TEXT,
+                    session_string TEXT,
+                    user_id BIGINT UNIQUE,
+                    username TEXT,
+                    first_name TEXT,
+                    is_active INTEGER DEFAULT 1
+                )
+            """)
         else:
             # SQLite
             c.execute("""
@@ -512,6 +525,19 @@ def init_db():
                     user_id BIGINT PRIMARY KEY,
                     username TEXT,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS userbot_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT UNIQUE,
+                    api_id INTEGER,
+                    api_hash TEXT,
+                    session_string TEXT,
+                    user_id BIGINT UNIQUE,
+                    username TEXT,
+                    first_name TEXT,
+                    is_active INTEGER DEFAULT 1
                 )
             """)
     try:
@@ -671,6 +697,61 @@ def set_setting(key, value):
                 "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (key, str(value))
             )
+
+def add_userbot_session(phone, api_id, api_hash, session_string, user_id, username, first_name):
+    with db_conn() as conn:
+        c = conn.cursor()
+        if USING_POSTGRES:
+            c.execute(
+                """
+                INSERT INTO userbot_sessions (phone, api_id, api_hash, session_string, user_id, username, first_name, is_active)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 1)
+                ON CONFLICT(phone) DO UPDATE SET
+                    api_id = EXCLUDED.api_id,
+                    api_hash = EXCLUDED.api_hash,
+                    session_string = EXCLUDED.session_string,
+                    user_id = EXCLUDED.user_id,
+                    username = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    is_active = 1
+                """,
+                (phone, api_id, api_hash, session_string, user_id, username, first_name)
+            )
+        else:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO userbot_sessions (phone, api_id, api_hash, session_string, user_id, username, first_name, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (phone, api_id, api_hash, session_string, user_id, username, first_name)
+            )
+
+def get_userbot_sessions():
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, phone, api_id, api_hash, session_string, user_id, username, first_name, is_active FROM userbot_sessions")
+        return c.fetchall()
+
+def get_active_userbot_sessions():
+    with db_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, phone, api_id, api_hash, session_string, user_id, username, first_name, is_active FROM userbot_sessions WHERE is_active = 1")
+        return c.fetchall()
+
+def delete_userbot_session(user_id):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        c.execute(f"DELETE FROM userbot_sessions WHERE user_id = {p}", (user_id,))
+
+def update_userbot_active_status(user_id, status):
+    with db_conn() as conn:
+        c = conn.cursor()
+        p = get_placeholder()
+        if USING_POSTGRES:
+            c.execute("UPDATE userbot_sessions SET is_active = %s WHERE user_id = %s", (status, user_id))
+        else:
+            c.execute("UPDATE userbot_sessions SET is_active = ? WHERE user_id = ?", (status, user_id))
 
 def cleanup_duplicate_pairs():
     """Removes duplicate pairs from target_pairs table, keeping only the first one."""
@@ -1202,7 +1283,82 @@ def get_all_vault_stats():
 # Global State
 # -----------------------------
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
-userbot = None
+class UserbotFleetManager:
+    def __init__(self):
+        self.clients = {} # { user_id: TelegramClient }
+        self.lock = asyncio.Lock()
+
+    async def start_all(self):
+        logger.info("📡 Initializing Userbot Fleet...")
+        sessions = get_active_userbot_sessions()
+        for sess in sessions:
+            try:
+                await self.start_client(sess)
+            except Exception as e:
+                logger.error(f"Failed to start Userbot {sess[7]} ({sess[1]}): {e}")
+
+    async def start_client(self, sess):
+        db_id, phone, api_id, api_hash, session_string, user_id, username, first_name, is_active = sess
+        async with self.lock:
+            if user_id in self.clients:
+                try:
+                    await self.clients[user_id].disconnect()
+                except Exception:
+                    pass
+            
+            from telethon.sessions import StringSession
+            client = TelegramClient(
+                StringSession(session_string),
+                int(api_id),
+                api_hash,
+                device_model="PC 64bit",
+                system_version="Windows 11",
+                app_version="4.11.2",
+                sequential_updates=True,
+                receive_updates=True
+            )
+            client.catch_up = False
+            await client.connect()
+            client.catch_up = False
+            client._me = await client.get_me()
+            setup_automation_handlers(client)
+            self.clients[user_id] = client
+            logger.info(f"🚀 Userbot {first_name} (@{username}) started.")
+            return client
+
+    async def stop_client(self, user_id):
+        async with self.lock:
+            client = self.clients.pop(user_id, None)
+            if client:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                logger.info(f"🛑 Userbot {user_id} stopped.")
+
+    def get_client(self, user_id):
+        return self.clients.get(user_id)
+
+    def get_all_clients(self):
+        return list(self.clients.values())
+        
+    def get_any_client(self):
+        if self.clients:
+            return list(self.clients.values())[0]
+        return None
+
+class UserbotProxy:
+    def __getattr__(self, name):
+        client = userbot_fleet_manager.get_any_client()
+        if not client:
+            raise AttributeError("No active userbots connected in the fleet.")
+        return getattr(client, name)
+
+    def __bool__(self):
+        return bool(userbot_fleet_manager.get_any_client())
+
+userbot_fleet_manager = UserbotFleetManager()
+userbot = UserbotProxy()
 userbot_init_lock = asyncio.Lock()
 userbot_lock = asyncio.Lock()
 
@@ -1407,30 +1563,39 @@ def is_task_running(task_key):
 # UI Helpers
 # -----------------------------
 def get_dashboard_text():
-    is_online = userbot and userbot.is_connected()
-    status = "🟢 ACTIVE" if is_online else "🔴 OFFLINE"
+    clients = userbot_fleet_manager.get_all_clients()
+    connected_clients = [c for c in clients if c.is_connected()]
+    status = "🟢 ACTIVE" if connected_clients else "🔴 OFFLINE"
     
     text = f"✨ *SYSTEM CONSOLE*\n"
     text += f"Status: `{status}`\n"
-    if is_online and hasattr(userbot, '_me') and userbot._me:
-        name = userbot._me.first_name or "User"
-        text += f"Account: `{name}`\n"
+    text += f"Connected Userbots: `{len(connected_clients)}` / `{len(get_userbot_sessions())}`\n"
+    if connected_clients:
+        names = []
+        for client in connected_clients:
+            me = getattr(client, '_me', None)
+            if me:
+                names.append(me.first_name or "User")
+        if names:
+            text += f"Accounts: `{', '.join(names)}`\n"
     
     text += "\n_Manage your automation pairs below:_"
     return text
 
 def get_dashboard_markup():
     markup = InlineKeyboardMarkup(row_width=1)
-    is_online = userbot and userbot.is_connected()
+    clients = userbot_fleet_manager.get_all_clients()
+    connected_clients = [c for c in clients if c.is_connected()]
     
-    if is_online:
+    if connected_clients:
         markup.add(InlineKeyboardButton("🎯 Target Pairs", callback_data="pairs_main"))
         markup.add(InlineKeyboardButton("📬 Private Media Forwarder", callback_data="pm_fwd_main"))
-        markup.add(InlineKeyboardButton("👤 User Account", callback_data="user_acc_main"))
+    
+    markup.add(InlineKeyboardButton("👤 Manage Userbots", callback_data="userbots_main"))
+    
+    if connected_clients:
         markup.add(InlineKeyboardButton("🔒 Vault Console", callback_data="vault_main"))
         markup.add(InlineKeyboardButton("🚫 Ban List", callback_data="banlist_main"))
-    else:
-        markup.add(InlineKeyboardButton("🔌 Connect Userbot", callback_data="user_connect_start"))
     
     return markup
 
@@ -1782,17 +1947,21 @@ async def get_chat_selection_markup(prefix, page=0):
     return markup
 
 
-def user_account_markup():
+def user_account_markup(user_id=None):
     markup = InlineKeyboardMarkup(row_width=2)
+    suffix = f"_{user_id}" if user_id else ""
     markup.add(
-        InlineKeyboardButton("👥 Groups", callback_data="user_acc_list_groups_0"),
-        InlineKeyboardButton("📢 Channels", callback_data="user_acc_list_channels_0")
+        InlineKeyboardButton("👥 Groups", callback_data=f"user_acc_list_groups_0{suffix}"),
+        InlineKeyboardButton("📢 Channels", callback_data=f"user_acc_list_channels_0{suffix}")
     )
     markup.add(
-        InlineKeyboardButton("👤 Private", callback_data="user_acc_list_private_0"),
-        InlineKeyboardButton("🤖 Bots", callback_data="user_acc_list_bots_0")
+        InlineKeyboardButton("👤 Private", callback_data=f"user_acc_list_private_0{suffix}"),
+        InlineKeyboardButton("🤖 Bots", callback_data=f"user_acc_list_bots_0{suffix}")
     )
-    markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
+    if user_id:
+        markup.add(InlineKeyboardButton("🔙 Back to Userbot details", callback_data=f"userbot_view_{user_id}"))
+    else:
+        markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
     return markup
 
 
@@ -1882,64 +2051,38 @@ async def get_or_create_target_topic(client, target_chat_id, topic_title, source
         return None
 
 async def _start_userbot_unlocked():
-    global userbot
-    api_id = get_setting("api_id")
-    api_hash = get_setting("api_hash")
-    session_string = get_setting("session_string")
-    
-    if not (api_id and api_hash and session_string):
-        return False, "Missing credentials"
-    
-    try:
-        if userbot:
-            try: await userbot.disconnect()
-            except Exception: pass
-            
-        # Load the string session directly without converting to on-disk SQLiteSession
-        from telethon.sessions import StringSession
-        
-        userbot = TelegramClient(
-            StringSession(session_string),
-            int(api_id),
-            api_hash,
-            device_model="PC 64bit",
-            system_version="Windows 11",
-            app_version="4.11.2",
-            sequential_updates=True,
-            receive_updates=True
-        )
-        # Dissociate connection catchup loops entirely
-        userbot.catch_up = False
-        await userbot.connect()
-        userbot.catch_up = False
-        # Cache user identity for synchronous access in UI
-        userbot._me = await userbot.get_me()
-        # Register automation handlers
-        setup_automation_handlers(userbot)
-        return True, "Userbot started"
-    except Exception as e:
-        return False, str(e)
+    await userbot_fleet_manager.start_all()
+    if userbot_fleet_manager.get_all_clients():
+        return True, "Userbot fleet started"
+    return False, "No active userbots connected"
 
 async def start_userbot():
     async with userbot_init_lock:
         return await _start_userbot_unlocked()
 
 async def ensure_userbot():
-    """Ensures the userbot is connected and ready."""
-    global userbot
+    """Ensures at least one userbot is connected and ready."""
     async with userbot_init_lock:
-        if not userbot:
+        clients = userbot_fleet_manager.get_all_clients()
+        if not clients:
             ok, msg = await _start_userbot_unlocked()
             if not ok: return False, msg
-        
-        if not userbot.is_connected():
-            try: 
-                await userbot.connect()
-                setup_automation_handlers(userbot)
-            except Exception as e: 
-                return False, f"Connection failed: {e}"
-        
-        return True, "Connected"
+            clients = userbot_fleet_manager.get_all_clients()
+            
+        connected_any = False
+        for client in clients:
+            if not client.is_connected():
+                try:
+                    await client.connect()
+                    setup_automation_handlers(client)
+                except Exception:
+                    pass
+            if client.is_connected():
+                connected_any = True
+                
+        if connected_any:
+            return True, "Connected"
+        return False, "No connected userbots"
 
 async def forward_to_log_bots(client, messages, source_chat_id):
     """Sends collected content (single or album) to all registered log bots."""
@@ -4922,55 +5065,133 @@ def handle_callbacks(call):
         bot.answer_callback_query(call.id, "Pair Deleted")
         handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': "pairs_main", 'message': call.message, 'id': call.id}))
 
-    elif data == "user_logout_do":
-        if userbot:
-            async def stop_ub():
-                try: await userbot.disconnect()
-                except Exception: pass
-            asyncio.run_coroutine_threadsafe(stop_ub(), loop)
+    elif data == "userbots_main":
+        bot.answer_callback_query(call.id)
+        sessions = get_userbot_sessions()
+        text = "👤 *Userbots Fleet Dashboard*\n\n"
+        text += f"Total Registered Userbots: `{len(sessions)}`\n\n"
         
-        userbot = None
-        with db_conn() as conn:
-            c = conn.cursor()
-            p = get_placeholder()
-            if USING_POSTGRES:
-                c.execute("DELETE FROM settings WHERE key IN ('session_string', 'api_id', 'api_hash')")
+        markup = InlineKeyboardMarkup(row_width=1)
+        for s in sessions:
+            db_id, phone, api_id, api_hash, session_string, u_id, username, first_name, is_active = s
+            client = userbot_fleet_manager.get_client(u_id)
+            is_connected = client.is_connected() if client else False
+            status_emoji = "🟢 Online" if is_connected else "🔴 Inactive/Offline" if not is_active else "🟡 Connected but Stopped"
+            markup.add(InlineKeyboardButton(f"👤 {first_name} (@{username or 'No Username'}) - {status_emoji}", callback_data=f"userbot_view_{u_id}"))
+            
+        markup.add(InlineKeyboardButton("🔌 Connect New Userbot", callback_data="user_connect_start"))
+        markup.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="dash_main"))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("userbot_view_"):
+        bot.answer_callback_query(call.id)
+        u_id = int(data.split("_")[-1])
+        sessions = get_userbot_sessions()
+        sess = [s for s in sessions if s[5] == u_id]
+        if not sess:
+            bot.edit_message_text("❌ Userbot session not found.", call.message.chat.id, call.message.message_id, reply_markup=get_dashboard_markup())
+            return
+        
+        db_id, phone, api_id, api_hash, session_string, user_id, username, first_name, is_active = sess[0]
+        client = userbot_fleet_manager.get_client(user_id)
+        is_connected = client.is_connected() if client else False
+        status_text = "🟢 Connected (Online)" if is_connected else "🔴 Inactive" if not is_active else "🔴 Stopped/Offline"
+        
+        text = f"👤 **Userbot Account Details**\n\n"
+        text += f"🏷️ **First Name:** `{first_name}`\n"
+        text += f"🏷️ **Username:** @{username or 'None'}\n"
+        text += f"🆔 **User ID:** `{user_id}`\n"
+        text += f"📱 **Phone:** `{phone}`\n"
+        text += f"API ID: `{api_id}`\n"
+        text += f"Status: {status_text}\n"
+        
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(InlineKeyboardButton("📂 Browse Chats", callback_data=f"user_acc_main_{user_id}"))
+        
+        toggle_label = "🔴 Disable Account" if is_active else "🟢 Enable Account"
+        markup.add(InlineKeyboardButton(toggle_label, callback_data=f"userbot_toggle_{user_id}"))
+        
+        markup.add(InlineKeyboardButton("🗑️ Logout / Remove", callback_data=f"userbot_logout_confirm_{user_id}"))
+        markup.add(InlineKeyboardButton("🔙 Back to List", callback_data="userbots_main"))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("userbot_toggle_"):
+        u_id = int(data.split("_")[-1])
+        sessions = get_userbot_sessions()
+        sess = [s for s in sessions if s[5] == u_id]
+        if sess:
+            db_id, phone, api_id, api_hash, session_string, user_id, username, first_name, is_active = sess[0]
+            new_active = 0 if is_active else 1
+            update_userbot_active_status(user_id, new_active)
+            if new_active == 1:
+                bot.answer_callback_query(call.id, "Starting client...")
+                async def start_new():
+                    try:
+                        await userbot_fleet_manager.start_client(sess[0])
+                        bot.send_message(call.message.chat.id, f"✅ Account `{first_name}` successfully enabled and started.")
+                    except Exception as e:
+                        bot.send_message(call.message.chat.id, f"❌ Failed to start `{first_name}`: {e}")
+                asyncio.run_coroutine_threadsafe(start_new(), loop)
             else:
-                c.execute("DELETE FROM settings WHERE key IN ('session_string', 'api_id', 'api_hash')")
-        
-        bot.answer_callback_query(call.id, "Session Cleared")
-        bot.edit_message_text("✅ *Userbot Logged Out Successfully*\nSession deleted.", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-        bot.send_message(call.message.chat.id, get_dashboard_text(), reply_markup=get_dashboard_markup(), parse_mode="Markdown")
+                bot.answer_callback_query(call.id, "Stopping client...")
+                async def stop_new():
+                    await userbot_fleet_manager.stop_client(user_id)
+                    bot.send_message(call.message.chat.id, f"🛑 Account `{first_name}` successfully disabled.")
+                asyncio.run_coroutine_threadsafe(stop_new(), loop)
+                
+        handle_callbacks(type('obj', (object,), {'from_user': call.from_user, 'data': f"userbot_view_{u_id}", 'message': call.message, 'id': call.id}))
+
+    elif data.startswith("userbot_logout_confirm_"):
+        bot.answer_callback_query(call.id)
+        u_id = int(data.split("_")[-1])
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("🚨 Yes, Logout", callback_data=f"userbot_logout_do_{u_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"userbot_view_{u_id}")
+        )
+        bot.edit_message_text("⚠️ *Logout Confirmation*\n\nThis will stop this userbot account and delete its session from the database. Are you sure?", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+    elif data.startswith("userbot_logout_do_"):
+        u_id = int(data.split("_")[-1])
+        bot.answer_callback_query(call.id, "Logging out...")
+        async def do_logout():
+            await userbot_fleet_manager.stop_client(u_id)
+            delete_userbot_session(u_id)
+            bot.send_message(call.message.chat.id, "✅ Userbot session successfully deleted.")
+            bot.send_message(call.message.chat.id, get_dashboard_text(), reply_markup=get_dashboard_markup(), parse_mode="Markdown")
+        asyncio.run_coroutine_threadsafe(do_logout(), loop)
 
     elif data == "user_connect_start":
         bot.answer_callback_query(call.id)
         admin_states[uid] = "awaiting_api_id"
         bot.send_message(call.message.chat.id, "Step 1: Please send your *API ID*.\n(Get it from my.telegram.org)", parse_mode="Markdown")
 
-    elif data == "user_acc_main":
+    elif data.startswith("user_acc_main"):
+        parts = data.split("_")
+        user_id = int(parts[-1]) if len(parts) > 3 and parts[-1].isdigit() else None
         bot.edit_message_text(
             "👤 *User Account Dashboard*\n\nBrowse and inspect the chats in your account:",
             call.message.chat.id,
             call.message.message_id,
-            reply_markup=user_account_markup(),
+            reply_markup=user_account_markup(user_id),
             parse_mode="Markdown"
         )
 
     elif data.startswith("user_acc_list_"):
-        # user_acc_list_{category}_{page}
         parts = data.split("_")
         category = parts[3]
         page = int(parts[4])
+        user_id = int(parts[5]) if len(parts) > 5 and parts[5].isdigit() else None
         bot.answer_callback_query(call.id, f"Loading {category}...")
         
         async def run_list():
-            if not userbot:
+            client = userbot_fleet_manager.get_client(user_id) if user_id else userbot_fleet_manager.get_any_client()
+            if not client:
                 bot.send_message(call.message.chat.id, "❌ Userbot not running.")
                 return
             
-            # Fetch dialogs
             all_dialogs = []
-            async for dialog in userbot.iter_dialogs():
+            async for dialog in client.iter_dialogs():
                 entity = dialog.entity
                 if category == "groups" and isinstance(entity, (types.Chat, types.Channel)) and not getattr(entity, 'broadcast', False):
                     all_dialogs.append(entity)
@@ -4981,27 +5202,26 @@ def handle_callbacks(call):
                 elif category == "private" and isinstance(entity, types.User) and not entity.bot:
                     all_dialogs.append(entity)
             
-            # Pagination
             page_size = 8
             start = page * page_size
             end = start + page_size
             page_items = all_dialogs[start:end]
             
             markup = InlineKeyboardMarkup(row_width=1)
+            suffix = f"_{user_id}" if user_id else ""
             for chat in page_items:
                 title = getattr(chat, 'title', None) or getattr(chat, 'first_name', None) or str(chat.id)
-                markup.add(InlineKeyboardButton(f"👁 {title}", callback_data=f"user_acc_view_{chat.id}"))
+                markup.add(InlineKeyboardButton(f"👁 {title}", callback_data=f"user_acc_view_{chat.id}{suffix}"))
             
-            # Nav buttons
             nav = []
             if page > 0:
-                nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"user_acc_list_{category}_{page-1}"))
+                nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"user_acc_list_{category}_{page-1}{suffix}"))
             if end < len(all_dialogs):
-                nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"user_acc_list_{category}_{page+1}"))
+                nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"user_acc_list_{category}_{page+1}{suffix}"))
             if nav:
                 markup.add(*nav)
             
-            markup.add(InlineKeyboardButton("🔙 Back to Categories", callback_data="user_acc_main"))
+            markup.add(InlineKeyboardButton("🔙 Back to Categories", callback_data=f"user_acc_main{suffix}"))
             
             msg = f"👤 *Account Browser:* {category.capitalize()}\nPage {page + 1} | Total: {len(all_dialogs)}"
             bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
@@ -5009,15 +5229,17 @@ def handle_callbacks(call):
         asyncio.run_coroutine_threadsafe(run_list(), loop)
 
     elif data.startswith("user_acc_view_"):
-        chat_id = int(data.split("_")[-1])
+        parts = data.split("_")
+        chat_id = int(parts[3])
+        user_id = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else None
         bot.answer_callback_query(call.id, "Fetching details...")
         
         async def run_view():
-            if not userbot: return
+            client = userbot_fleet_manager.get_client(user_id) if user_id else userbot_fleet_manager.get_any_client()
+            if not client: return
             try:
-                chat = await resolve_target_id(userbot, chat_id)
-                # For message count, we can use a trick with limit=0
-                history = await userbot.get_messages(chat, limit=0)
+                chat = await resolve_target_id(client, chat_id)
+                history = await client.get_messages(chat, limit=0)
                 msg_count = history.total
                 title = getattr(chat, 'title', None) or getattr(chat, 'first_name', 'Unknown')
                 
@@ -5031,7 +5253,8 @@ def handle_callbacks(call):
                     info += f"🔗 *Username:* @{chat.username}\n"
                 
                 markup = InlineKeyboardMarkup(row_width=1)
-                markup.add(InlineKeyboardButton("🔙 Back to List", callback_data=f"user_acc_main"))
+                suffix = f"_{user_id}" if user_id else ""
+                markup.add(InlineKeyboardButton("🔙 Back to List", callback_data=f"user_acc_main{suffix}"))
                 
                 bot.edit_message_text(info, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
 
@@ -5042,21 +5265,24 @@ def handle_callbacks(call):
 
 async def complete_login(uid, client: TelegramClient, chat_id):
     session_string = client.session.save()
-    set_setting("api_id", login_data[uid]["api_id"])
-    set_setting("api_hash", login_data[uid]["api_hash"])
-    set_setting("session_string", session_string)
+    me = await client.get_me()
+    phone = login_data[uid]["phone"]
+    api_id = login_data[uid]["api_id"]
+    api_hash = login_data[uid]["api_hash"]
     
+    add_userbot_session(phone, api_id, api_hash, session_string, me.id, me.username, me.first_name)
+    
+    # Start it in the fleet manager
+    sessions = get_userbot_sessions()
+    sess = [s for s in sessions if s[5] == me.id]
+    if sess:
+        await userbot_fleet_manager.start_client(sess[0])
+        
     admin_states.pop(uid, None)
     login_data.pop(uid, None)
     
-    bot.send_message(chat_id, "✅ *Userbot Connected (Telethon)!*", parse_mode="Markdown")
-    
-    # Restart the global userbot with new session
-    ok, msg = await start_userbot()
-    if ok:
-        bot.send_message(chat_id, get_dashboard_text(), reply_markup=get_dashboard_markup(), parse_mode="Markdown")
-    else:
-        bot.send_message(chat_id, f"❌ Failed to start userbot: {msg}")
+    bot.send_message(chat_id, f"✅ *Userbot Connected (Telethon)!*\nAccount: `{me.first_name}` (@{me.username or 'No Username'})", parse_mode="Markdown")
+    bot.send_message(chat_id, get_dashboard_text(), reply_markup=get_dashboard_markup(), parse_mode="Markdown")
 
 @bot.message_handler(func=lambda m: is_authorized_manager(m.from_user.id) and admin_states.get(m.from_user.id))
 def handle_state_inputs(message):
@@ -5309,7 +5535,11 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
     status_msg = bot.send_message(admin_chat_id, f"📜 *History Scrape: `{s_title}`*\n\n🔍 Scanned: `0`\n📥 Collected: `0`\n📤 Sent: `0`", reply_markup=markup, parse_mode="Markdown")
     
     try:
-        target_chat = await resolve_target_id(userbot, sid)
+        client, target_chat = await resolve_target_across_fleet(sid)
+        if not client:
+            client = userbot
+            target_chat = await resolve_target_id(client, sid)
+        userbot = client
         
         target_topic = None
         if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
@@ -5723,6 +5953,16 @@ async def resolve_target_id(client: TelegramClient, target_ref):
 
     raise ValueError(f"Could not find or access chat: {target_ref}")
 
+async def resolve_target_across_fleet(target_ref):
+    for client in userbot_fleet_manager.get_all_clients():
+        try:
+            entity = await resolve_target_id(client, target_ref)
+            if entity:
+                return client, entity
+        except Exception:
+            continue
+    return None, None
+
 async def run_collection_preview(admin_chat_id, message_id, pair_id):
     is_ok, msg = await ensure_userbot()
     if not is_ok:
@@ -5748,7 +5988,11 @@ async def run_collection_preview(admin_chat_id, message_id, pair_id):
         pass
 
     try:
-        source_chat = await resolve_target_id(userbot, sid)
+        client, source_chat = await resolve_target_across_fleet(sid)
+        if not client:
+            client = userbot
+            source_chat = await resolve_target_id(client, sid)
+        userbot = client
         
         target_topic = None
         if s_topic and str(s_topic).strip().lower() not in ["", "0", "none"]:
@@ -6395,11 +6639,17 @@ async def run_release(admin_chat_id, pair_id, added_by=None, interval=1.2, relea
     
         source_chat = None
         source_accessible = False
-        try:
-            source_chat = await resolve_target_id(userbot, sid_ref)
+        client, source_chat = await resolve_target_across_fleet(sid_ref)
+        if not client:
+            client = userbot
+            try:
+                source_chat = await resolve_target_id(client, sid_ref)
+            except Exception:
+                pass
+        userbot = client
+        
+        if source_chat:
             source_accessible = True
-        except Exception as se:
-            logger.warning(f"Source chat {sid_ref} is not accessible: {se}. Releasing via vault fallback.")
             
         try:
             target_chat = await resolve_target_id(userbot, tid_ref)
@@ -7283,15 +7533,17 @@ async def main():
     try:
         ok, msg = await start_userbot()
         if ok: 
-            logger.info("✅ Userbot started")
-            # Cache warmer: fetch dialogs to avoid PeerIdInvalid
-            logger.info("📡 Warming up peer cache...")
-            async for _ in userbot.iter_dialogs(limit=50): pass
+            logger.info("✅ Userbot fleet started")
+            # Cache warmer: fetch dialogs for all active clients
+            for client in userbot_fleet_manager.get_all_clients():
+                logger.info(f"📡 Warming up peer cache for {client._me.first_name}...")
+                try:
+                    async for _ in client.iter_dialogs(limit=50): pass
+                except Exception:
+                    pass
             logger.info("✅ Peer cache warmed")
     except Exception as e: 
         logger.error(f"Userbot startup error: {e}")
-        if "AuthKeyDuplicatedError" in str(e):
-            logger.critical("🚨 CRITICAL: Duplicate session detected. Please log out from other devices or delete session from DB.")
 
     # Start telebot polling with AUTO-RESTART
     def run_polling():
