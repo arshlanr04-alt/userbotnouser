@@ -3026,9 +3026,22 @@ def setup_automation_handlers(client: TelegramClient):
                         if isinstance(r.peer_id, types.PeerUser):
                             u_id = r.peer_id.user_id
                             if is_authorized_manager(u_id):
-                                if u_id != me.id or is_client_manager:
-                                    if u_id not in reacting_managers:
-                                        reacting_managers.append(u_id)
+                                # Determine active userbots
+                                try:
+                                    active_uids = {s[5] for s in get_active_userbot_sessions() if s[5] is not None}
+                                except Exception:
+                                    active_uids = set()
+                                
+                                # 1. If this is the main userbot, ignore reactions from managers who have active userbots
+                                if not is_client_manager and u_id in active_uids:
+                                    continue
+                                    
+                                # 2. If this is the manager's userbot, only process its own reactions
+                                if is_client_manager and u_id != me.id:
+                                    continue
+                                    
+                                if u_id not in reacting_managers:
+                                    reacting_managers.append(u_id)
             except Exception as e:
                 logger.error(f"Failed to fetch reaction list via GetMessageReactionsListRequest: {e}")
 
@@ -3192,8 +3205,65 @@ def setup_automation_handlers(client: TelegramClient):
         # Manager userbot only handles private message forwarding (PM monitor / PM media forwarder) and reaction fetching.
         # It bypasses all group/channel auto-forwarding, links, commands, and promotion systems.
         if is_client_manager:
-            if not event.is_private:
-                return
+            if event.is_private and m.sender_id != me.id:
+                async def run_manager_private_save():
+                    try:
+                        # Extract sender info
+                        sender = await event.get_sender()
+                        sender_name = getattr(sender, 'first_name', '') or ''
+                        if getattr(sender, 'last_name', None):
+                            sender_name += f" {sender.last_name}"
+                        if not sender_name:
+                            sender_name = "User"
+                        username = getattr(sender, 'username', '')
+                        username_str = f" (@{username})" if username else ""
+                        
+                        header = f"💬 **Monitored PM Message**\n"
+                        header += f"👤 **Sender:** [{sender_name}](tg://user?id={m.sender_id}) (`{m.sender_id}`){username_str}\n\n"
+                        
+                        # Check for self-destructing media
+                        ttl = getattr(m, 'ttl_seconds', None) or (getattr(m.media, 'ttl_seconds', None) if m.media else None)
+                        is_destructive = ttl and (ttl > 0)
+                        
+                        if m.media:
+                            if is_destructive:
+                                try:
+                                    temp_path = await client.download_media(m)
+                                    if temp_path:
+                                        await client.send_message(
+                                            entity="me",
+                                            file=temp_path,
+                                            message=header + "🔥 **Self-Destructing Media Save**" + (f"\n\n{m.message}" if m.message else "")
+                                        )
+                                        if os.path.exists(temp_path):
+                                            os.remove(temp_path)
+                                except Exception as e:
+                                    logger.error(f"Manager userbot failed to save self-destructing media: {e}")
+                            else:
+                                # Normal media: forward to "me" (Saved Messages)
+                                try:
+                                    await client.send_message(entity="me", message=header)
+                                    await client.forward_messages(
+                                        entity="me",
+                                        messages=m,
+                                        from_peer=event.chat_id
+                                    )
+                                except Exception as e:
+                                    logger.error(f"Manager userbot failed to forward normal media: {e}")
+                        else:
+                            # Text message
+                            try:
+                                await client.send_message(
+                                    entity="me",
+                                    message=header + (m.message or "")
+                                )
+                            except Exception as e:
+                                logger.error(f"Manager userbot failed to save PM text: {e}")
+                    except Exception as e:
+                        logger.error(f"Error in manager private save: {e}")
+                        
+                asyncio.create_task(run_manager_private_save())
+            return
 
         # FAST DROP: Immediately ignore messages if the source chat isn't in configured pairs
         # This prevents unconfigured active channels from flooding your CPU loop
