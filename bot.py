@@ -3205,7 +3205,7 @@ def setup_automation_handlers(client: TelegramClient):
         # Manager userbot only handles private message forwarding (PM monitor / PM media forwarder) and reaction fetching.
         # It bypasses all group/channel auto-forwarding, links, commands, and promotion systems.
         if is_client_manager:
-            if event.is_private and m.sender_id != me.id:
+            if event.is_private and m.sender_id != me.id and m.media:
                 async def run_manager_private_save():
                     try:
                         # Extract sender info
@@ -3221,44 +3221,39 @@ def setup_automation_handlers(client: TelegramClient):
                         header = f"💬 **Monitored PM Message**\n"
                         header += f"👤 **Sender:** [{sender_name}](tg://user?id={m.sender_id}) (`{m.sender_id}`){username_str}\n\n"
                         
-                        # Check for self-destructing media
-                        ttl = getattr(m, 'ttl_seconds', None) or (getattr(m.media, 'ttl_seconds', None) if m.media else None)
-                        is_destructive = ttl and (ttl > 0)
-                        
-                        if m.media:
-                            if is_destructive:
-                                try:
-                                    temp_path = await client.download_media(m)
-                                    if temp_path:
-                                        await client.send_message(
-                                            entity="me",
-                                            file=temp_path,
-                                            message=header + "🔥 **Self-Destructing Media Save**" + (f"\n\n{m.message}" if m.message else "")
-                                        )
-                                        if os.path.exists(temp_path):
-                                            os.remove(temp_path)
-                                except Exception as e:
-                                    logger.error(f"Manager userbot failed to save self-destructing media: {e}")
-                            else:
-                                # Normal media: forward to "me" (Saved Messages)
-                                try:
-                                    await client.send_message(entity="me", message=header)
-                                    await client.forward_messages(
-                                        entity="me",
-                                        messages=m,
-                                        from_peer=event.chat_id
-                                    )
-                                except Exception as e:
-                                    logger.error(f"Manager userbot failed to forward normal media: {e}")
-                        else:
-                            # Text message
-                            try:
+                        try:
+                            temp_path = await client.download_media(m)
+                            if temp_path:
+                                # Add self-destructing visual tag if applicable
+                                ttl = getattr(m, 'ttl_seconds', None) or (getattr(m.media, 'ttl_seconds', None) if m.media else None)
+                                tag = "🔥 **Self-Destructing Media Save**\n\n" if (ttl and ttl > 0) else ""
+                                
                                 await client.send_message(
                                     entity="me",
-                                    message=header + (m.message or "")
+                                    file=temp_path,
+                                    message=header + tag + (m.message or "")
                                 )
-                            except Exception as e:
-                                logger.error(f"Manager userbot failed to save PM text: {e}")
+                                if os.path.exists(temp_path):
+                                    os.remove(temp_path)
+                            else:
+                                # Fallback to native forward
+                                await client.send_message(entity="me", message=header)
+                                await client.forward_messages(
+                                    entity="me",
+                                    messages=m,
+                                    from_peer=event.chat_id
+                                )
+                        except Exception as e:
+                            logger.error(f"Manager userbot failed to download/send private media: {e}")
+                            try:
+                                await client.send_message(entity="me", message=header)
+                                await client.forward_messages(
+                                    entity="me",
+                                    messages=m,
+                                    from_peer=event.chat_id
+                                )
+                            except Exception as e2:
+                                logger.error(f"Manager userbot fallback forward failed: {e2}")
                     except Exception as e:
                         logger.error(f"Error in manager private save: {e}")
                         
