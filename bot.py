@@ -1362,6 +1362,33 @@ userbot = UserbotProxy()
 userbot_init_lock = asyncio.Lock()
 userbot_lock = asyncio.Lock()
 
+userbot_login_states = {}
+
+async def complete_userbot_login_flow(sender_id, temp_client, event):
+    try:
+        session_string = temp_client.session.save()
+        me = await temp_client.get_me()
+        state_data = userbot_login_states.get(sender_id)
+        phone = state_data["phone"]
+        api_id = state_data["api_id"]
+        api_hash = state_data["api_hash"]
+        
+        # Save session to DB
+        add_userbot_session(phone, api_id, api_hash, session_string, me.id, me.username, me.first_name)
+        
+        # Start in fleet manager
+        sessions = get_userbot_sessions()
+        sess = [s for s in sessions if s[5] == me.id]
+        if sess:
+            await userbot_fleet_manager.start_client(sess[0])
+            
+        userbot_login_states.pop(sender_id, None)
+        await event.reply(f"✅ **Success! Manager Account Promoted to Userbot**\n\nAccount: `{me.first_name}` (@{me.username or 'No Username'})\n\nThis manager account is now running as a manager userbot client in the fleet.")
+    except Exception as e:
+        logger.error(f"Error completing userbot login flow: {e}")
+        await event.reply(f"❌ **Failed to complete login setup:** {e}")
+        userbot_login_states.pop(sender_id, None)
+
 # (State dictionaries declared globally at the top of the file)
 
 def get_active_tasks_report():
@@ -2945,6 +2972,7 @@ def setup_automation_handlers(client: TelegramClient):
             if isinstance(msg.peer_id, types.PeerUser):
                 is_group_or_channel = False
 
+        is_client_manager = me and is_authorized_manager(me.id)
         reacting_managers = []
         if is_group_or_channel:
             try:
@@ -2959,9 +2987,10 @@ def setup_automation_handlers(client: TelegramClient):
                     for r in res.reactions:
                         if isinstance(r.peer_id, types.PeerUser):
                             u_id = r.peer_id.user_id
-                            if u_id != me.id and is_authorized_manager(u_id):
-                                if u_id not in reacting_managers:
-                                    reacting_managers.append(u_id)
+                            if is_authorized_manager(u_id):
+                                if u_id != me.id or is_client_manager:
+                                    if u_id not in reacting_managers:
+                                        reacting_managers.append(u_id)
             except Exception as e:
                 logger.error(f"Failed to fetch reaction list via GetMessageReactionsListRequest: {e}")
 
@@ -2970,9 +2999,10 @@ def setup_automation_handlers(client: TelegramClient):
                 for rr in event.reactions.recent_reactions:
                     if isinstance(rr.peer_id, types.PeerUser):
                         u_id = rr.peer_id.user_id
-                        if u_id != me.id and is_authorized_manager(u_id):
-                            if u_id not in reacting_managers:
-                                reacting_managers.append(u_id)
+                        if is_authorized_manager(u_id):
+                            if u_id != me.id or is_client_manager:
+                                if u_id not in reacting_managers:
+                                    reacting_managers.append(u_id)
 
         if not msg:
             try:
@@ -2992,9 +3022,10 @@ def setup_automation_handlers(client: TelegramClient):
             for rr in msg.reactions.recent_reactions:
                 if isinstance(rr.peer_id, types.PeerUser):
                     u_id = rr.peer_id.user_id
-                    if u_id != me.id and is_authorized_manager(u_id):
-                        if u_id not in reacting_managers:
-                            reacting_managers.append(u_id)
+                    if is_authorized_manager(u_id):
+                        if u_id != me.id or is_client_manager:
+                            if u_id not in reacting_managers:
+                                reacting_managers.append(u_id)
 
         if reacting_managers:
             for manager_id in reacting_managers:
@@ -3005,6 +3036,9 @@ def setup_automation_handlers(client: TelegramClient):
                         processed_manager_reactions_cache.pop(0)
                     logger.warning(f"Manager {manager_id} reacted. Initiating download and send.")
                     asyncio.create_task(process_manager_reaction(client, peer_id, msg_id, msg, manager_id))
+
+        if is_client_manager:
+            return
 
         cache_key = (peer_id, msg_id)
         if cache_key in processed_reactions_cache:
@@ -3107,6 +3141,22 @@ def setup_automation_handlers(client: TelegramClient):
         m = event.message
         if not m: return
 
+        # Ensure client._me is cached
+        if not hasattr(client, '_me') or not client._me:
+            try:
+                client._me = await client.get_me()
+            except Exception as e:
+                logger.error(f"Failed to get_me() for userbot: {e}")
+
+        me = getattr(client, '_me', None)
+        is_client_manager = me and is_authorized_manager(me.id)
+
+        # Manager userbot only handles private message forwarding (PM monitor / PM media forwarder) and reaction fetching.
+        # It bypasses all group/channel auto-forwarding, links, commands, and promotion systems.
+        if is_client_manager:
+            if not event.is_private:
+                return
+
         # FAST DROP: Immediately ignore messages if the source chat isn't in configured pairs
         # This prevents unconfigured active channels from flooding your CPU loop
         configured_pairs = get_target_pairs()
@@ -3116,19 +3166,89 @@ def setup_automation_handlers(client: TelegramClient):
         if current_chat_str not in configured_sources and not event.is_private:
             return # Drop execution immediately before hitting locks or networks
 
-        # Ensure client._me is cached
-        if not hasattr(client, '_me') or not client._me:
-            try:
-                client._me = await client.get_me()
-            except Exception as e:
-                logger.error(f"Failed to get_me() for userbot: {e}")
-
-        me = getattr(client, '_me', None)
-
         # Message Link Auto-Downloader/Forwarder System
         is_primary_admin = (m.sender_id == ADMIN_ID) or (me and m.sender_id == me.id)
         is_manager = is_primary_admin or is_authorized_manager(m.sender_id)
         if event.is_private and is_manager and m.text:
+            text_clean = m.text.strip().lower()
+            if text_clean in [".login", "/login"] or m.sender_id in userbot_login_states:
+                if text_clean in [".login", "/login"]:
+                    userbot_login_states[m.sender_id] = {"state": "awaiting_phone"}
+                    await event.reply("📲 **Manager Userbot Login Sequence Initiated**\n\nPlease send your **Phone Number** (with country code, e.g., `+1234567890`):")
+                    return
+                else:
+                    state_data = userbot_login_states[m.sender_id]
+                    current_state = state_data["state"]
+                    
+                    if current_state == "awaiting_phone":
+                        phone = m.text.strip()
+                        state_data["phone"] = phone
+                        
+                        # Fetch default API ID and Hash
+                        default_api_id = int(os.getenv("API_ID", 0))
+                        default_api_hash = os.getenv("API_HASH", "")
+                        if not default_api_id or not default_api_hash:
+                            sessions = get_userbot_sessions()
+                            if sessions:
+                                default_api_id = int(sessions[0][2])
+                                default_api_hash = sessions[0][3]
+                                
+                        if not default_api_id or not default_api_hash:
+                            await event.reply("❌ **API ID or API Hash not configured on the main server.** Please configure them first.")
+                            userbot_login_states.pop(m.sender_id, None)
+                            return
+                            
+                        state_data["api_id"] = default_api_id
+                        state_data["api_hash"] = default_api_hash
+                        
+                        await event.reply("⏳ **Sending OTP (Telethon)...**")
+                        
+                        try:
+                            temp_client = TelegramClient(StringSession(), default_api_id, default_api_hash)
+                            await temp_client.connect()
+                            send_code = await temp_client.send_code_request(phone)
+                            state_data["client"] = temp_client
+                            state_data["phone_code_hash"] = send_code.phone_code_hash
+                            state_data["state"] = "awaiting_otp"
+                            await event.reply("📩 **OTP Sent!**\n\nPlease send the **OTP code** you received (e.g. `12345` or space-separated):")
+                        except Exception as e:
+                            await event.reply(f"❌ **Failed to send OTP:** {e}")
+                            userbot_login_states.pop(m.sender_id, None)
+                        return
+                        
+                    elif current_state == "awaiting_otp":
+                        otp = m.text.strip().replace(" ", "")
+                        temp_client = state_data["client"]
+                        phone = state_data["phone"]
+                        phone_code_hash = state_data["phone_code_hash"]
+                        
+                        await event.reply("⏳ **Verifying OTP...**")
+                        
+                        try:
+                            await temp_client.sign_in(phone=phone, code=otp, phone_code_hash=phone_code_hash)
+                            await complete_userbot_login_flow(m.sender_id, temp_client, event)
+                        except errors.SessionPasswordNeededError:
+                            state_data["state"] = "awaiting_password"
+                            await event.reply("🔐 **Cloud Password Required**\n\nYour account has Two-Step Verification enabled. Please send your **Cloud Password**:")
+                        except Exception as e:
+                            await event.reply(f"❌ **OTP verification failed:** {e}")
+                            userbot_login_states.pop(m.sender_id, None)
+                        return
+                        
+                    elif current_state == "awaiting_password":
+                        password = m.text.strip()
+                        temp_client = state_data["client"]
+                        
+                        await event.reply("⏳ **Verifying Password...**")
+                        
+                        try:
+                            await temp_client.sign_in(password=password)
+                            await complete_userbot_login_flow(m.sender_id, temp_client, event)
+                        except Exception as e:
+                            await event.reply(f"❌ **Password verification failed:** {e}")
+                            userbot_login_states.pop(m.sender_id, None)
+                        return
+
             link_info = parse_telegram_message_link(m.text)
             if link_info:
                 async def handle_link():
@@ -3581,10 +3701,17 @@ def setup_automation_handlers(client: TelegramClient):
                                     await event.reply("📭 No additional managers authorized.")
                                     return
                                 
+                                try:
+                                    userbot_sessions = get_userbot_sessions()
+                                    userbot_uids = {s[5] for s in userbot_sessions if s[5] is not None}
+                                except Exception:
+                                    userbot_uids = set()
+                                
                                 text_lines = ["📋 **Authorized Managers:**\n"]
                                 for uid, uname in rows:
                                     escaped_uname = uname.replace("_", "\\_") if uname else ""
-                                    text_lines.append(f"👤 `{uid}`" + (f" (@{escaped_uname})" if uname else ""))
+                                    suffix = " (Manager + Userbot)" if uid in userbot_uids else ""
+                                    text_lines.append(f"👤 `{uid}`" + (f" (@{escaped_uname})" if uname else "") + suffix)
                                 
                                 await event.reply("\n".join(text_lines))
                             except Exception as e:
@@ -4015,10 +4142,17 @@ def cmd_list_managers(message):
             bot.send_message(message.chat.id, "📭 *No additional managers authorized.*", parse_mode="Markdown")
             return
         
+        try:
+            userbot_sessions = get_userbot_sessions()
+            userbot_uids = {s[5] for s in userbot_sessions if s[5] is not None}
+        except Exception:
+            userbot_uids = set()
+            
         text_lines = ["📋 *Authorized Managers:*\n"]
         for uid, uname in rows:
             escaped_uname = uname.replace("_", "\\_") if uname else ""
-            text_lines.append(f"👤 `{uid}`" + (f" (@{escaped_uname})" if uname else ""))
+            suffix = " (Manager + Userbot)" if uid in userbot_uids else ""
+            text_lines.append(f"👤 `{uid}`" + (f" (@{escaped_uname})" if uname else "") + suffix)
         
         bot.send_message(message.chat.id, "\n".join(text_lines), parse_mode="Markdown")
     except Exception as e:
