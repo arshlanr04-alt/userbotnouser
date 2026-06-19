@@ -3286,7 +3286,7 @@ def setup_automation_handlers(client: TelegramClient):
                         state_data["api_id"] = default_api_id
                         state_data["api_hash"] = default_api_hash
                         
-                        await event.reply("⏳ **Sending OTP (Telethon)...**")
+                        await event.reply(f"⏳ **Sending OTP (Telethon)...**\n\n*Debug Info*:\n• **API ID**: `{default_api_id}`\n• **Phone**: `{phone}`")
                         
                         try:
                             temp_client = TelegramClient(
