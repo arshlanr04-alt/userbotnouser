@@ -3244,7 +3244,7 @@ def setup_automation_handlers(client: TelegramClient):
                             send_code = await temp_client.send_code_request(phone)
                             userbot_login_states[m.sender_id]["client"] = temp_client
                             userbot_login_states[m.sender_id]["phone_code_hash"] = send_code.phone_code_hash
-                            await event.reply("📩 **OTP Sent!**\n\nPlease send the **OTP code** you received:")
+                            await event.reply("📩 **OTP Sent!**\n\n⚠️ **IMPORTANT**: To prevent Telegram from automatically blocking/invalidating your login code, **DO NOT** send the code as a plain number.\n\nSend it with dashes or spaces between the digits (e.g. if your code is `53488`, send it as **`5-3-4-8-8`** or **`5 3 4 8 8`**):")
                         except Exception as e:
                             await event.reply(f"❌ **Failed to send OTP:** {e}")
                             userbot_login_states.pop(m.sender_id, None)
@@ -3302,14 +3302,14 @@ def setup_automation_handlers(client: TelegramClient):
                             state_data["client"] = temp_client
                             state_data["phone_code_hash"] = send_code.phone_code_hash
                             state_data["state"] = "awaiting_otp"
-                            await event.reply("📩 **OTP Sent!**\n\nPlease send the **OTP code** you received (e.g. `12345` or space-separated):")
+                            await event.reply("📩 **OTP Sent!**\n\n⚠️ **IMPORTANT**: To prevent Telegram from automatically blocking/invalidating your login code, **DO NOT** send the code as a plain number.\n\nSend it with dashes or spaces between the digits (e.g. if your code is `53488`, send it as **`5-3-4-8-8`** or **`5 3 4 8 8`**):")
                         except Exception as e:
                             await event.reply(f"❌ **Failed to send OTP:** {e}")
                             userbot_login_states.pop(m.sender_id, None)
                         return
                         
                     elif current_state == "awaiting_otp":
-                        otp = m.text.strip().replace(" ", "")
+                        otp = "".join(c for c in m.text if c.isdigit())
                         temp_client = state_data["client"]
                         phone = state_data["phone"]
                         phone_code_hash = state_data["phone_code_hash"]
