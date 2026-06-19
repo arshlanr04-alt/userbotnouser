@@ -630,7 +630,28 @@ async def check_and_promote_user(client, user_id, username, text_content, reply_
             await reply_fn(f"❌ Failed to process promotion: {e}")
             return True
             
-    return False
+async def notify_admin_flood_wait(client, action_name, seconds):
+    try:
+        from datetime import timedelta
+        duration = str(timedelta(seconds=seconds))
+        me = await client.get_me()
+        userbot_info = f"@{me.username}" if me.username else f"ID: {me.id} ({me.first_name})"
+        msg = (
+            f"⏳ **Userbot Flood Wait Alert**\n\n"
+            f"👤 **Userbot**: `{userbot_info}`\n"
+            f"⚙️ **Action**: `{action_name}`\n"
+            f"⏱️ **Wait Required**: `{seconds}s` (~{duration})"
+        )
+        try:
+            bot.send_message(ADMIN_ID, msg, parse_mode="Markdown")
+        except Exception:
+            try:
+                admin_entity = await client.get_entity(ADMIN_ID)
+                await client.send_message(admin_entity, msg)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"Error in notify_admin_flood_wait: {e}")
 
 def is_user_banned(user_id, username=None):
     try:
@@ -2204,6 +2225,8 @@ async def vault_media(client, messages, source_chat_id, log_chat_id, t_name):
             await asyncio.sleep(2)
         except errors.FloodWaitError as fwe:
             logger.warning(f"⏳ VAULT FLOOD: Waiting {fwe.seconds}s...")
+            await notify_admin_flood_wait(client, "Vault Storage Upload", fwe.seconds)
+            await notify_admin_flood_wait(client, "Vault Storage Upload", fwe.seconds)
             await asyncio.sleep(fwe.seconds)
             return await vault_media(client, messages, source_chat_id, log_chat_id, t_name) # Retry
         except Exception as e:
@@ -2426,6 +2449,8 @@ async def send_mirrored_content(client, tid, messages, default_t_topic, is_mir, 
                         break # Success!
             except errors.FloodWaitError as fwe:
                 logger.warning(f"⏳ MIRROR FLOOD: Waiting {fwe.seconds}s...")
+                await notify_admin_flood_wait(client, "Mirroring Content", fwe.seconds)
+                await notify_admin_flood_wait(client, "Mirroring Content", fwe.seconds)
                 await asyncio.sleep(fwe.seconds)
             except (errors.rpcerrorlist.WorkerBusyTooLongRetryError, errors.rpcerrorlist.TimedOutError):
                 await asyncio.sleep(2)
@@ -2615,6 +2640,8 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                         media_to_file[msg.id] = path
                 except errors.FloodWaitError as fwe:
                     logger.warning(f"⏳ PIPELINE FLOOD: Download limit hit. Sleeping {fwe.seconds}s...")
+                    await notify_admin_flood_wait(client, "Pipeline Download", fwe.seconds)
+                    await notify_admin_flood_wait(client, "Pipeline Download", fwe.seconds)
                     await asyncio.sleep(fwe.seconds)
                     try:
                         async with media_semaphore:
@@ -2743,6 +2770,17 @@ async def process_automation_pipeline(client, messages, source_chat_id):
                                 
                     except Exception as fwd_err:
                         logger.error(f"Native Forward dropped ({fwd_err}). Activating fallback downmirror...")
+                        if "wait of" in str(fwd_err).lower() or isinstance(fwd_err, errors.FloodWaitError):
+                            sec = 0
+                            if isinstance(fwd_err, errors.FloodWaitError):
+                                sec = fwd_err.seconds
+                            else:
+                                import re
+                                match = re.search(r"wait of (\d+) seconds", str(fwd_err), re.IGNORECASE)
+                                if match:
+                                    sec = int(match.group(1))
+                            if sec > 0:
+                                await notify_admin_flood_wait(client, "Native Forwarding", sec)
                         await send_mirrored_content(client, tid, valid_messages, t_topic, is_mir, sid)
 
             # Execution Step C: Backup Storage Vault Allocation
@@ -5918,6 +5956,8 @@ async def run_history_scrape(admin_chat_id, pair_id, limit=None, start_date=None
                                 media_to_file[msg.id] = path
                         except errors.FloodWaitError as fwe:
                             logger.warning(f"⏳ SCRAPE FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
+                            await notify_admin_flood_wait(userbot, "Scrape Download", fwe.seconds)
+                            await notify_admin_flood_wait(userbot, "Scrape Download", fwe.seconds)
                             if fwe.seconds <= 5:
                                 await asyncio.sleep(fwe.seconds)
                                 try:
@@ -6578,6 +6618,7 @@ async def run_collection(admin_chat_id, pair_id, limit=None):
                                         media_to_file[msg.id] = path
                                 except errors.FloodWaitError as fwe:
                                     logger.warning(f"⏳ COLLECTION FLOOD: Download media flood wait of {fwe.seconds}s required. Skipping media.")
+                                    await notify_admin_flood_wait(userbot, "Collection Download", fwe.seconds)
                                     if fwe.seconds <= 5:
                                         await asyncio.sleep(fwe.seconds)
                                         try:
