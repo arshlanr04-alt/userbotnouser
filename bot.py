@@ -2849,6 +2849,52 @@ def setup_automation_handlers(client: TelegramClient):
     client._automation_handlers_registered = True
 
     processed_reactions_cache = []
+    processed_manager_reactions_cache = []
+
+    async def process_manager_reaction(client, peer_id, msg_id, msg, manager_id):
+        try:
+            album_msgs = [msg]
+            if msg.grouped_id is not None:
+                try:
+                    entity = await client.get_entity(peer_id)
+                    msg_ids = list(range(max(1, msg_id - 10), msg_id + 11))
+                    async with userbot_lock:
+                        siblings = await client.get_messages(entity, ids=msg_ids)
+                    album_msgs = [m for m in siblings if m and m.grouped_id == msg.grouped_id]
+                    album_msgs.sort(key=lambda x: x.id)
+                    if not album_msgs:
+                        album_msgs = [msg]
+                except Exception as e:
+                    logger.error(f"Failed to fetch album siblings for manager reaction msg_id={msg_id}: {e}")
+                    album_msgs = [msg]
+
+            logger.warning(f"Downloading media for manager {manager_id} from message {msg_id} in {peer_id}...")
+            temp_paths = []
+            album_text = next((m.message for m in album_msgs if m.message), "")
+            for m in album_msgs:
+                if m.media:
+                    try:
+                        path = await client.download_media(m)
+                        if path:
+                            temp_paths.append(path)
+                    except Exception as e:
+                        logger.error(f"Failed to download media for manager reaction msg_id={m.id}: {e}")
+
+            try:
+                if temp_paths:
+                    await client.send_file(manager_id, file=temp_paths, caption=album_text)
+                elif album_text:
+                    await client.send_message(manager_id, album_text)
+                logger.warning(f"Successfully sent manager reacted message to manager {manager_id}")
+            except Exception as e:
+                logger.error(f"Failed to send manager reacted message to manager {manager_id}: {e}")
+
+            for temp_path in temp_paths:
+                if temp_path and os.path.exists(temp_path):
+                    try: os.remove(temp_path)
+                    except Exception: pass
+        except Exception as ex:
+            logger.error(f"Error in process_manager_reaction: {ex}")
 
     @client.on(events.Raw)
     async def reaction_handler(event):
@@ -2880,10 +2926,6 @@ def setup_automation_handlers(client: TelegramClient):
             
         logger.warning(f"📢 Reaction raw event received: type={type(event).__name__}, msg_id={msg_id}, peer_id={peer_id}")
         
-        cache_key = (peer_id, msg_id)
-        if cache_key in processed_reactions_cache:
-            return
-            
         if not hasattr(client, '_me') or not client._me:
             try:
                 client._me = await client.get_me()
@@ -2894,7 +2936,25 @@ def setup_automation_handlers(client: TelegramClient):
         me = getattr(client, '_me', None)
         if not me:
             return
-            
+
+        is_group_or_channel = True
+        if isinstance(event, types.UpdateMessageReactions):
+            if isinstance(event.peer, types.PeerUser):
+                is_group_or_channel = False
+        elif msg and msg.peer_id:
+            if isinstance(msg.peer_id, types.PeerUser):
+                is_group_or_channel = False
+
+        reacting_managers = []
+        if is_group_or_channel:
+            if hasattr(event, 'reactions') and event.reactions and getattr(event.reactions, 'recent_reactions', None):
+                for rr in event.reactions.recent_reactions:
+                    if isinstance(rr.peer_id, types.PeerUser):
+                        u_id = rr.peer_id.user_id
+                        if u_id != me.id and is_authorized_manager(u_id):
+                            if u_id not in reacting_managers:
+                                reacting_managers.append(u_id)
+
         if not msg:
             try:
                 logger.warning(f"Fetching message details for reaction msg_id={msg_id} in peer_id={peer_id}")
@@ -2908,7 +2968,29 @@ def setup_automation_handlers(client: TelegramClient):
             except Exception as e:
                 logger.error(f"Failed to fetch message for reaction: {e}")
                 return
-                
+
+        if is_group_or_channel and msg and msg.reactions and msg.reactions.recent_reactions:
+            for rr in msg.reactions.recent_reactions:
+                if isinstance(rr.peer_id, types.PeerUser):
+                    u_id = rr.peer_id.user_id
+                    if u_id != me.id and is_authorized_manager(u_id):
+                        if u_id not in reacting_managers:
+                            reacting_managers.append(u_id)
+
+        if reacting_managers:
+            for manager_id in reacting_managers:
+                manager_cache_key = (peer_id, msg_id, manager_id)
+                if manager_cache_key not in processed_manager_reactions_cache:
+                    processed_manager_reactions_cache.append(manager_cache_key)
+                    if len(processed_manager_reactions_cache) > 1000:
+                        processed_manager_reactions_cache.pop(0)
+                    logger.warning(f"Manager {manager_id} reacted. Initiating download and send.")
+                    asyncio.create_task(process_manager_reaction(client, peer_id, msg_id, msg, manager_id))
+
+        cache_key = (peer_id, msg_id)
+        if cache_key in processed_reactions_cache:
+            return
+            
         if not msg or not msg.reactions:
             logger.warning("No reactions on fetched message.")
             return
