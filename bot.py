@@ -2947,6 +2947,25 @@ def setup_automation_handlers(client: TelegramClient):
 
         reacting_managers = []
         if is_group_or_channel:
+            try:
+                from telethon.tl.functions.messages import GetMessageReactionsListRequest
+                entity = await client.get_entity(peer_id)
+                res = await client(GetMessageReactionsListRequest(
+                    peer=entity,
+                    id=msg_id,
+                    limit=100
+                ))
+                if res and res.reactions:
+                    for r in res.reactions:
+                        if isinstance(r.peer_id, types.PeerUser):
+                            u_id = r.peer_id.user_id
+                            if u_id != me.id and is_authorized_manager(u_id):
+                                if u_id not in reacting_managers:
+                                    reacting_managers.append(u_id)
+            except Exception as e:
+                logger.error(f"Failed to fetch reaction list via GetMessageReactionsListRequest: {e}")
+
+        if not reacting_managers and is_group_or_channel:
             if hasattr(event, 'reactions') and event.reactions and getattr(event.reactions, 'recent_reactions', None):
                 for rr in event.reactions.recent_reactions:
                     if isinstance(rr.peer_id, types.PeerUser):
@@ -2969,7 +2988,7 @@ def setup_automation_handlers(client: TelegramClient):
                 logger.error(f"Failed to fetch message for reaction: {e}")
                 return
 
-        if is_group_or_channel and msg and msg.reactions and msg.reactions.recent_reactions:
+        if not reacting_managers and is_group_or_channel and msg and msg.reactions and msg.reactions.recent_reactions:
             for rr in msg.reactions.recent_reactions:
                 if isinstance(rr.peer_id, types.PeerUser):
                     u_id = rr.peer_id.user_id
