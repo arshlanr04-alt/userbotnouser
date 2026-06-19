@@ -3209,17 +3209,56 @@ def setup_automation_handlers(client: TelegramClient):
         is_manager = is_primary_admin or is_authorized_manager(m.sender_id)
         if event.is_private and is_manager and m.text:
             text_clean = m.text.strip().lower()
-            if text_clean in [".login", "/login"] or m.sender_id in userbot_login_states:
-                if text_clean in [".login", "/login"]:
-                    userbot_login_states[m.sender_id] = {"state": "awaiting_phone"}
-                    await event.reply("📲 **Manager Userbot Login Sequence Initiated**\n\nPlease send your **Phone Number** (with country code, e.g., `+1234567890`):")
-                    return
+            parts = m.text.split()
+            cmd_start = parts[0].lower() if parts else ""
+            
+            if cmd_start in [".login", "/login"] or m.sender_id in userbot_login_states:
+                if cmd_start in [".login", "/login"]:
+                    if len(parts) >= 4:
+                        phone = parts[1].strip().replace(" ", "")
+                        try:
+                            api_id = int(parts[2].strip())
+                        except ValueError:
+                            await event.reply("❌ **Invalid API ID format.** Must be an integer.")
+                            return
+                        api_hash = parts[3].strip()
+                        
+                        userbot_login_states[m.sender_id] = {
+                            "state": "awaiting_otp",
+                            "phone": phone,
+                            "api_id": api_id,
+                            "api_hash": api_hash
+                        }
+                        
+                        await event.reply("⏳ **Connecting & Sending OTP...**")
+                        try:
+                            temp_client = TelegramClient(
+                                StringSession(), 
+                                api_id, 
+                                api_hash,
+                                device_model="PC 64bit",
+                                system_version="Windows 11",
+                                app_version="4.11.2"
+                            )
+                            await temp_client.connect()
+                            send_code = await temp_client.send_code_request(phone)
+                            userbot_login_states[m.sender_id]["client"] = temp_client
+                            userbot_login_states[m.sender_id]["phone_code_hash"] = send_code.phone_code_hash
+                            await event.reply("📩 **OTP Sent!**\n\nPlease send the **OTP code** you received:")
+                        except Exception as e:
+                            await event.reply(f"❌ **Failed to send OTP:** {e}")
+                            userbot_login_states.pop(m.sender_id, None)
+                        return
+                    else:
+                        userbot_login_states[m.sender_id] = {"state": "awaiting_phone"}
+                        await event.reply("📲 **Manager Userbot Login Sequence Initiated**\n\nPlease send your **Phone Number** (with country code, e.g., `+1234567890`):\n\n*Tip*: You can also login in one go using:\n`.login <phone> <api_id> <api_hash>`")
+                        return
                 else:
                     state_data = userbot_login_states[m.sender_id]
                     current_state = state_data["state"]
                     
                     if current_state == "awaiting_phone":
-                        phone = m.text.strip()
+                        phone = m.text.strip().replace(" ", "")
                         state_data["phone"] = phone
                         
                         # Fetch default API ID and Hash
@@ -3232,7 +3271,7 @@ def setup_automation_handlers(client: TelegramClient):
                                 default_api_hash = sessions[0][3]
                                 
                         if not default_api_id or not default_api_hash:
-                            await event.reply("❌ **API ID or API Hash not configured on the main server.** Please configure them first.")
+                            await event.reply("❌ **API ID or API Hash not configured on the main server.**\n\nPlease connect using:\n`.login <phone> <api_id> <api_hash>`")
                             userbot_login_states.pop(m.sender_id, None)
                             return
                             
@@ -3242,7 +3281,14 @@ def setup_automation_handlers(client: TelegramClient):
                         await event.reply("⏳ **Sending OTP (Telethon)...**")
                         
                         try:
-                            temp_client = TelegramClient(StringSession(), default_api_id, default_api_hash)
+                            temp_client = TelegramClient(
+                                StringSession(), 
+                                default_api_id, 
+                                default_api_hash,
+                                device_model="PC 64bit",
+                                system_version="Windows 11",
+                                app_version="4.11.2"
+                            )
                             await temp_client.connect()
                             send_code = await temp_client.send_code_request(phone)
                             state_data["client"] = temp_client
