@@ -3564,7 +3564,8 @@ def setup_automation_handlers(client: TelegramClient):
                                 
                                 text_lines = ["📋 **Authorized Managers:**\n"]
                                 for uid, uname in rows:
-                                    text_lines.append(f"👤 `{uid}`" + (f" (@{uname})" if uname else ""))
+                                    escaped_uname = uname.replace("_", "\\_") if uname else ""
+                                    text_lines.append(f"👤 `{uid}`" + (f" (@{escaped_uname})" if uname else ""))
                                 
                                 await event.reply("\n".join(text_lines))
                             except Exception as e:
@@ -3997,7 +3998,8 @@ def cmd_list_managers(message):
         
         text_lines = ["📋 *Authorized Managers:*\n"]
         for uid, uname in rows:
-            text_lines.append(f"👤 `{uid}`" + (f" (@{uname})" if uname else ""))
+            escaped_uname = uname.replace("_", "\\_") if uname else ""
+            text_lines.append(f"👤 `{uid}`" + (f" (@{escaped_uname})" if uname else ""))
         
         bot.send_message(message.chat.id, "\n".join(text_lines), parse_mode="Markdown")
     except Exception as e:
