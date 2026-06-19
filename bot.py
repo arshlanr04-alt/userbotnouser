@@ -3264,6 +3264,14 @@ def setup_automation_handlers(client: TelegramClient):
                         # Fetch default API ID and Hash
                         default_api_id = int(os.getenv("API_ID", 0))
                         default_api_hash = os.getenv("API_HASH", "")
+                        
+                        if not default_api_id or not default_api_hash:
+                            try:
+                                default_api_id = int(get_setting("api_id", 0))
+                                default_api_hash = get_setting("api_hash", "")
+                            except Exception:
+                                pass
+                                
                         if not default_api_id or not default_api_hash:
                             sessions = get_userbot_sessions()
                             if sessions:
