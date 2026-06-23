@@ -1364,6 +1364,9 @@ class UserbotFleetManager:
         return list(self.clients.values())
         
     def get_any_client(self):
+        for client in self.clients.values():
+            if client and client.is_connected():
+                return client
         if self.clients:
             return list(self.clients.values())[0]
         return None
