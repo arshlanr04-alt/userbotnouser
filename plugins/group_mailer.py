@@ -1,6 +1,6 @@
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
-from testuserbot_v3 import bot, get_dashboard_markup, is_authorized_manager
-import testuserbot_v3
+from bot import bot, get_dashboard_markup, is_authorized_manager
+import bot
 
 # Save the original get_dashboard_markup function
 original_get_dashboard_markup = get_dashboard_markup
