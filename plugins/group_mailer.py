@@ -1,10 +1,20 @@
+import sys
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-# Dynamically import the main module (either userbot or testuserbot_v3)
-try:
-    import userbot as main_module
-except ImportError:
-    import testuserbot_v3 as main_module
+# Find the active running bot module from sys.modules to prevent circular imports/double execution
+main_module = None
+for name in ['__main__', 'userbot', 'testuserbot_v3']:
+    mod = sys.modules.get(name)
+    if mod and hasattr(mod, 'get_dashboard_markup'):
+        main_module = mod
+        break
+
+if main_module is None:
+    # Fallback to standard import if not loaded as a script main
+    try:
+        import userbot as main_module
+    except ImportError:
+        import testuserbot_v3 as main_module
 
 bot = main_module.bot
 get_dashboard_markup = main_module.get_dashboard_markup
@@ -19,7 +29,7 @@ def new_get_dashboard_markup():
     markup.add(InlineKeyboardButton("📬 Group Mailer", callback_data="group_mailer_main"))
     return markup
 
-# Monkeypatch the dashboard markup function in the correct main module
+# Monkeypatch the dashboard markup function in the correct main module instance
 main_module.get_dashboard_markup = new_get_dashboard_markup
 
 # Register callback query handler
