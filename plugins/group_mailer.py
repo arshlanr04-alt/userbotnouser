@@ -39,6 +39,10 @@ os.makedirs(MEDIA_DIR, exist_ok=True)
 # In-memory cache for userbot groups to avoid constant API polling
 userbot_groups_cache = {}
 
+# Keep track of active running broadcast processes
+# format: { userbot_id: Task }
+active_mailer_tasks = {}
+
 def get_mailer_status():
     selected_ub = get_setting("gm_selected_userbot")
     selected_groups = json.loads(get_setting("gm_selected_group_ids") or "[]")
@@ -107,11 +111,14 @@ def show_groups_page(chat_id, message_id, ub_id, page=0):
     
     if not groups:
         markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("🔙 Back", callback_data="group_mailer_main"))
+        markup.add(
+            InlineKeyboardButton("🔄 Refresh List", callback_data=f"gm_refresh_{page}"),
+            InlineKeyboardButton("🔙 Back", callback_data="group_mailer_main")
+        )
         bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
-            text="👥 *Groups:* Userbot is not in any groups or channels yet.",
+            text="👥 *Groups:* Userbot is not in any groups yet. Tap **Refresh List** to fetch groups dynamically.",
             reply_markup=markup,
             parse_mode="Markdown"
         )
@@ -141,10 +148,11 @@ def show_groups_page(chat_id, message_id, ub_id, page=0):
         nav_row.append(InlineKeyboardButton("Next ▶️", callback_data=f"gm_page_{page+1}"))
     markup.row(*nav_row)
     
-    # Bulk actions row
+    # Bulk actions and Refresh row
     markup.row(
         InlineKeyboardButton("Select All", callback_data=f"gm_all_sel_{page}"),
-        InlineKeyboardButton("Clear All", callback_data=f"gm_all_clr_{page}")
+        InlineKeyboardButton("Clear All", callback_data=f"gm_all_clr_{page}"),
+        InlineKeyboardButton("🔄 Refresh", callback_data=f"gm_refresh_{page}")
     )
     
     markup.add(InlineKeyboardButton("🔙 Back to Mailer Console", callback_data="group_mailer_main"))
@@ -152,7 +160,7 @@ def show_groups_page(chat_id, message_id, ub_id, page=0):
     bot.edit_message_text(
         chat_id=chat_id,
         message_id=message_id,
-        text=f"👥 *SELECT TARGET GROUPS* (Selected: `{len(selected_ids)}`)\nToggle the checkboxes below to select targets for the broadcast:",
+        text=f"👥 *SELECT TARGET GROUPS* (Selected: `{len(selected_ids)}`)\nToggle target checkboxes. Click **Refresh** if userbot joined new groups recently:",
         reply_markup=markup,
         parse_mode="Markdown"
     )
@@ -278,6 +286,35 @@ def handle_group_mailer_callbacks(call):
             
             future = asyncio.run_coroutine_threadsafe(fetch_dialogs_async(client, selected_ub), loop)
             future.add_done_callback(on_fetch_done)
+
+    elif data.startswith("gm_refresh_"):
+        page = int(data.split("_")[-1])
+        if not selected_ub:
+            bot.answer_callback_query(call.id, "❌ Userbot is not selected!")
+            return
+            
+        client = userbot_fleet_manager.get_client(int(selected_ub))
+        if not client or not client.is_connected():
+            bot.answer_callback_query(call.id, "❌ Selected userbot is offline!", show_alert=True)
+            return
+            
+        bot.answer_callback_query(call.id, "🔄 Syncing new groups...")
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="🔄 *Syncing new groups from Telegram... Please wait...*",
+            parse_mode="Markdown"
+        )
+        
+        # Clear cache and trigger fresh download
+        if selected_ub in userbot_groups_cache:
+            del userbot_groups_cache[selected_ub]
+            
+        def on_sync_done(fut):
+            show_groups_page(chat_id, message_id, selected_ub, page)
+            
+        future = asyncio.run_coroutine_threadsafe(fetch_dialogs_async(client, selected_ub), loop)
+        future.add_done_callback(on_sync_done)
 
     elif data.startswith("gm_page_"):
         page = int(data.split("_")[-1])
@@ -433,8 +470,8 @@ def handle_mailer_states(message):
     admin_states[uid] = None
     bot.reply_to(message, f"✅ *Mailer Message Saved!* (Type: `{msg_type.upper()}`)", parse_mode="Markdown")
 
-# Asynchronous broadcast implementation
-async def run_broadcast(client, group_ids, msg_data, chat_id, is_auto=False):
+# Asynchronous broadcast implementation (Modified to support dynamic updates mid-operation)
+async def run_broadcast(client, initial_group_ids, msg_data, chat_id, is_auto=False):
     success = 0
     failed = 0
     
@@ -449,8 +486,25 @@ async def run_broadcast(client, group_ids, msg_data, chat_id, is_auto=False):
 
     # Save last run timestamp
     set_setting("gm_last_run", str(time.time()))
+    
+    # Store processed IDs in this run
+    sent_group_ids = set()
 
-    for idx, group_id in enumerate(group_ids):
+    while True:
+        # 1. Fetch live selected groups from DB settings on EVERY iteration
+        live_group_ids = json.loads(get_setting("gm_selected_group_ids") or "[]")
+        
+        # 2. Determine which selected groups haven't been processed yet
+        remaining_groups = [g for g in live_group_ids if g not in sent_group_ids]
+        
+        # 3. If there are no more remaining selected groups, end the operation
+        if not remaining_groups:
+            break
+            
+        # 4. Process the next group
+        group_id = remaining_groups[0]
+        sent_group_ids.add(group_id)
+        
         try:
             msg_type = msg_data.get("type")
             if msg_type == "text":
@@ -463,20 +517,23 @@ async def run_broadcast(client, group_ids, msg_data, chat_id, is_auto=False):
             failed += 1
             logger.error(f"Group Mailer error sending to {group_id}: {e}")
 
-        # Update progress
-        if progress_msg and chat_id and ((idx + 1) % 5 == 0 or (idx + 1) == len(group_ids)):
-            pct = int(((idx + 1) / len(group_ids)) * 100)
+        # 5. Live progress updates based on the current live count
+        total_groups = len(live_group_ids)
+        processed_count = len(sent_group_ids)
+        
+        if progress_msg and chat_id and (processed_count % 3 == 0 or processed_count == total_groups):
+            pct = int((processed_count / max(1, total_groups)) * 100)
             try:
                 bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=progress_msg.message_id,
-                    text=f"⏳ *{label} progress:* `{pct}%` (Success: `{success}`, Failed: `{failed}`)",
+                    text=f"⏳ *{label} progress:* `{pct}%` (Success: `{success}`, Failed: `{failed}` | Total Selected: `{total_groups}`)",
                     parse_mode="Markdown"
                 )
             except Exception:
                 pass
 
-        # Random delay between 5 to 10 seconds to avoid flooding limits
+        # Random delay between 5 to 10 seconds to protect account
         delay = random.randint(5, 10)
         await asyncio.sleep(delay)
 
