@@ -47,7 +47,7 @@ def handle_group_mailer_callbacks(call):
         markup = InlineKeyboardMarkup()
         
         markup.row(
-            InlineKeyboardButton("👤 Select Userbot", callback_data="gm_select_userbot"),
+            InlineKeyboardButton("👤 Select Userbot", callback_data="gm_select_userbot")
         )
         
         # Row 1: Select Userbot, Import, Export Group (Horizontally aligned)
