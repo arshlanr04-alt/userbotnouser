@@ -4,6 +4,7 @@ import json
 import asyncio
 import logging
 import random
+import time
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger(__name__)
@@ -36,13 +37,13 @@ MEDIA_DIR = "mailer_media"
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
 # In-memory cache for userbot groups to avoid constant API polling
-# format: { userbot_id: [ {"id": int, "title": str, "username": str}, ... ] }
 userbot_groups_cache = {}
 
 def get_mailer_status():
     selected_ub = get_setting("gm_selected_userbot")
     selected_groups = json.loads(get_setting("gm_selected_group_ids") or "[]")
     msg_data = json.loads(get_setting("gm_message") or "{}")
+    interval = int(get_setting("gm_repeat_interval") or "0")
     
     ub_status = "🔴 None"
     if selected_ub:
@@ -56,10 +57,24 @@ def get_mailer_status():
     if msg_data:
         msg_status = f"🟢 Configured ({msg_data.get('type').upper()})"
         
+    rep_status = "🔴 Off (Manual Only)"
+    if interval > 0:
+        if interval < 60:
+            rep_status = f"🟢 Every {interval} minutes"
+        else:
+            rep_status = f"🟢 Every {interval // 60} hour(s)"
+            
+    last_run_time = "Never"
+    last_run_timestamp = float(get_setting("gm_last_run") or "0")
+    if last_run_timestamp > 0:
+        last_run_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_run_timestamp))
+        
     return (
         f"👤 *Selected Userbot:* {ub_status}\n"
         f"👥 *Groups Selected:* `{len(selected_groups)}` groups marked\n"
-        f"💬 *Mailer Message:* {msg_status}"
+        f"💬 *Mailer Message:* {msg_status}\n"
+        f"⏰ *Repeat Interval:* `{rep_status}`\n"
+        f"📅 *Last Run:* `{last_run_time}`"
     )
 
 # Save the original get_dashboard_markup function
@@ -155,6 +170,17 @@ def handle_group_mailer_callbacks(call):
     selected_ub = get_setting("gm_selected_userbot")
 
     if data == "group_mailer_main":
+        # Save admin chat ID for background notifications
+        set_setting("gm_admin_chat_id", str(chat_id))
+        
+        interval = int(get_setting("gm_repeat_interval") or "0")
+        if interval == 0:
+            rep_btn_text = "⏰ Repeat: Off"
+        elif interval < 60:
+            rep_btn_text = f"⏰ Repeat: {interval}m"
+        else:
+            rep_btn_text = f"⏰ Repeat: {interval // 60}h"
+
         markup = InlineKeyboardMarkup()
         
         # Row 1: Select Userbot, Select Msg
@@ -163,9 +189,10 @@ def handle_group_mailer_callbacks(call):
             InlineKeyboardButton("💬 Select Msg", callback_data="gm_select_msg")
         )
         
-        # Row 2: Groups Selector
+        # Row 2: Groups, Repeat Interval
         markup.row(
-            InlineKeyboardButton("👥 Groups", callback_data="gm_groups_list")
+            InlineKeyboardButton("👥 Groups", callback_data="gm_groups_list"),
+            InlineKeyboardButton(rep_btn_text, callback_data="gm_repeat_menu")
         )
         
         # Row 3: Start Operation
@@ -219,14 +246,11 @@ def handle_group_mailer_callbacks(call):
     elif data.startswith("gm_set_ub_"):
         ub_id = data.split("_")[-1]
         set_setting("gm_selected_userbot", ub_id)
-        # Clear selected groups when userbot is changed
         set_setting("gm_selected_group_ids", "[]")
         if ub_id in userbot_groups_cache:
             del userbot_groups_cache[ub_id]
             
         bot.answer_callback_query(call.id, "✅ Userbot selected! Target groups reset.")
-        
-        # Refresh console
         handle_group_mailer_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': 'group_mailer_main', 'message': call.message, 'id': call.id})())
 
     elif data == "gm_groups_list":
@@ -301,6 +325,39 @@ def handle_group_mailer_callbacks(call):
             "Please send or forward the message you want to broadcast (can be text, photo, video, or document with captions)."
         )
         bot.answer_callback_query(call.id)
+
+    elif data == "gm_repeat_menu":
+        markup = InlineKeyboardMarkup()
+        markup.row(
+            InlineKeyboardButton("❌ Off (Manual)", callback_data="gm_setrep_0"),
+            InlineKeyboardButton("30 Min", callback_data="gm_setrep_30")
+        )
+        markup.row(
+            InlineKeyboardButton("1 Hour", callback_data="gm_setrep_60"),
+            InlineKeyboardButton("2 Hours", callback_data="gm_setrep_120")
+        )
+        markup.row(
+            InlineKeyboardButton("6 Hours", callback_data="gm_setrep_360"),
+            InlineKeyboardButton("12 Hours", callback_data="gm_setrep_720")
+        )
+        markup.row(
+            InlineKeyboardButton("24 Hours", callback_data="gm_setrep_1440")
+        )
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data="group_mailer_main"))
+        
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="⏰ *SELECT REPEAT INTERVAL*\nConfigure how often the userbot should automatically broadcast the message:",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("gm_setrep_"):
+        minutes = int(data.split("_")[-1])
+        set_setting("gm_repeat_interval", str(minutes))
+        bot.answer_callback_query(call.id, "✅ Repeat interval updated!")
+        handle_group_mailer_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': 'group_mailer_main', 'message': call.message, 'id': call.id})())
 
     elif data == "gm_start_op":
         selected_groups = json.loads(get_setting("gm_selected_group_ids") or "[]")
@@ -377,10 +434,21 @@ def handle_mailer_states(message):
     bot.reply_to(message, f"✅ *Mailer Message Saved!* (Type: `{msg_type.upper()}`)", parse_mode="Markdown")
 
 # Asynchronous broadcast implementation
-async def run_broadcast(client, group_ids, msg_data, chat_id):
+async def run_broadcast(client, group_ids, msg_data, chat_id, is_auto=False):
     success = 0
     failed = 0
-    progress_msg = bot.send_message(chat_id, "⏳ *Mailer progress:* `0%`", parse_mode="Markdown")
+    
+    label = "⏰ Scheduled Mailer" if is_auto else "📬 Group Mailer"
+    
+    progress_msg = None
+    if chat_id:
+        try:
+            progress_msg = bot.send_message(chat_id, f"⏳ *{label} progress:* `0%`", parse_mode="Markdown")
+        except Exception:
+            pass
+
+    # Save last run timestamp
+    set_setting("gm_last_run", str(time.time()))
 
     for idx, group_id in enumerate(group_ids):
         try:
@@ -395,14 +463,14 @@ async def run_broadcast(client, group_ids, msg_data, chat_id):
             failed += 1
             logger.error(f"Group Mailer error sending to {group_id}: {e}")
 
-        # Update progress every 5 groups
-        if (idx + 1) % 5 == 0 or (idx + 1) == len(group_ids):
+        # Update progress
+        if progress_msg and chat_id and ((idx + 1) % 5 == 0 or (idx + 1) == len(group_ids)):
             pct = int(((idx + 1) / len(group_ids)) * 100)
             try:
                 bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=progress_msg.message_id,
-                    text=f"⏳ *Mailer progress:* `{pct}%` (Success: `{success}`, Failed: `{failed}`)",
+                    text=f"⏳ *{label} progress:* `{pct}%` (Success: `{success}`, Failed: `{failed}`)",
                     parse_mode="Markdown"
                 )
             except Exception:
@@ -412,8 +480,44 @@ async def run_broadcast(client, group_ids, msg_data, chat_id):
         delay = random.randint(5, 10)
         await asyncio.sleep(delay)
 
-    bot.send_message(
-        chat_id,
-        f"✅ *Group Mailer Completed!*\n\n🟢 Success: `{success}`\n🔴 Failed: `{failed}`",
-        parse_mode="Markdown"
-    )
+    if chat_id:
+        try:
+            bot.send_message(
+                chat_id,
+                f"✅ *{label} Completed!*\n\n🟢 Success: `{success}`\n🔴 Failed: `{failed}`",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+# Background Scheduled Supervisor Loop
+async def scheduler_loop():
+    logger.info("⏰ Group Mailer background scheduler loop running...")
+    while True:
+        try:
+            interval_minutes = int(get_setting("gm_repeat_interval") or "0")
+            if interval_minutes > 0:
+                last_run = float(get_setting("gm_last_run") or "0")
+                now = time.time()
+                
+                # Check if it is time to run
+                if now - last_run >= (interval_minutes * 60):
+                    selected_ub = get_setting("gm_selected_userbot")
+                    selected_groups = json.loads(get_setting("gm_selected_group_ids") or "[]")
+                    msg_data = json.loads(get_setting("gm_message") or "{}")
+                    
+                    if selected_ub and selected_groups and msg_data:
+                        client = userbot_fleet_manager.get_client(int(selected_ub))
+                        if client and client.is_connected():
+                            admin_chat_id = get_setting("gm_admin_chat_id")
+                            dest_chat = int(admin_chat_id) if admin_chat_id else None
+                            
+                            # Execute broadcast asynchronously on loop thread
+                            await run_broadcast(client, selected_groups, msg_data, dest_chat, is_auto=True)
+        except Exception as e:
+            logger.error(f"Error in Group Mailer scheduler loop: {e}")
+            
+        await asyncio.sleep(30)  # Check every 30 seconds
+
+# Start the background schedule task safely
+asyncio.run_coroutine_threadsafe(scheduler_loop(), loop)
