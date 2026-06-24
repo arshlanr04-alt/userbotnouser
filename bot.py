@@ -7928,6 +7928,41 @@ log_bot_manager = LogBotManager()
 # Main Loop
 # -----------------------------
 async def main():
+    # Load external plugins dynamically from plugins directory
+    plugins_dir = os.path.join(os.path.dirname(__file__), "plugins")
+    if os.path.exists(plugins_dir):
+        import importlib.util
+        import glob
+        import sys
+        
+        initial_cb_count = len(bot.callback_query_handlers)
+        initial_msg_count = len(bot.message_handlers)
+        
+        plugin_files = glob.glob(os.path.join(plugins_dir, "*.py"))
+        for fpath in plugin_files:
+            if os.path.basename(fpath) == "__init__.py":
+                continue
+            module_name = f"plugins.{os.path.splitext(os.path.basename(fpath))[0]}"
+            try:
+                spec = importlib.util.spec_from_file_location(module_name, fpath)
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+                logger.info(f"🔌 Loaded plugin: {module_name}")
+            except Exception as e:
+                logger.error(f"❌ Error loading plugin {fpath}: {e}")
+                
+        # Re-order handlers so plugin handlers run before default catch-alls
+        new_cb_handlers = bot.callback_query_handlers[initial_cb_count:]
+        if new_cb_handlers:
+            del bot.callback_query_handlers[initial_cb_count:]
+            bot.callback_query_handlers = new_cb_handlers + bot.callback_query_handlers
+            
+        new_msg_handlers = bot.message_handlers[initial_msg_count:]
+        if new_msg_handlers:
+            del bot.message_handlers[initial_msg_count:]
+            bot.message_handlers = new_msg_handlers + bot.message_handlers
+
     # Start web server IMMEDIATELY for Render health checks
     logger.info(f"Starting web server on port {PORT}...")
     threading.Thread(target=run_web, daemon=True).start()
