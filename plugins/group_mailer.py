@@ -6,6 +6,8 @@ import logging
 import random
 import time
 from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest, CheckChatInviteRequest
 
 logger = logging.getLogger(__name__)
 
@@ -36,27 +38,25 @@ loop = main_module.loop
 MEDIA_DIR = "mailer_media"
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
-# In-memory cache for userbot groups to avoid constant API polling
+# In-memory cache for userbot groups
 userbot_groups_cache = {}
 
-# Keep track of active running broadcast processes
-# format: { userbot_id: Task }
-active_mailer_tasks = {}
-
 def get_mailer_status():
-    selected_ub = get_setting("gm_selected_userbot")
+    selected_ubs = json.loads(get_setting("gm_selected_userbots") or "[]")
     selected_groups = json.loads(get_setting("gm_selected_group_ids") or "[]")
     msg_data = json.loads(get_setting("gm_message") or "{}")
     interval = int(get_setting("gm_repeat_interval") or "0")
+    links_map = json.loads(get_setting("gm_group_links_map") or "{}")
     
-    ub_status = "🔴 None"
-    if selected_ub:
-        client = userbot_fleet_manager.get_client(int(selected_ub))
-        if client and client.is_connected():
-            ub_status = f"🟢 Connected (ID: {selected_ub})"
-        else:
-            ub_status = f"🟡 Offline (ID: {selected_ub})"
-            
+    ub_status = f"🔴 None"
+    if selected_ubs:
+        connected_count = 0
+        for ub_id in selected_ubs:
+            client = userbot_fleet_manager.get_client(int(ub_id))
+            if client and client.is_connected():
+                connected_count += 1
+        ub_status = f"🟢 Configured ({connected_count}/{len(selected_ubs)} Connected)"
+        
     msg_status = "🔴 None"
     if msg_data:
         msg_status = f"🟢 Configured ({msg_data.get('type').upper()})"
@@ -74,12 +74,59 @@ def get_mailer_status():
         last_run_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_run_timestamp))
         
     return (
-        f"👤 *Selected Userbot:* {ub_status}\n"
+        f"👤 *Selected Userbots:* {ub_status}\n"
         f"👥 *Groups Selected:* `{len(selected_groups)}` groups marked\n"
+        f"🔗 *Mapped Join Links:* `{len(links_map)}` links stored\n"
         f"💬 *Mailer Message:* {msg_status}\n"
         f"⏰ *Repeat Interval:* `{rep_status}`\n"
         f"📅 *Last Run:* `{last_run_time}`"
     )
+
+# Translate Telethon exceptions to user-friendly reasons
+def get_friendly_error(exception):
+    err_str = str(exception).lower()
+    if "write_forbidden" in err_str or "chatwriteforbidden" in err_str:
+        return "Write forbidden (Account restricted, banned, or lacks permission to post)"
+    elif "deactivated" in err_str or "authkeydeactivated" in err_str:
+        return "Userbot account is deactivated or banned by Telegram"
+    elif "flood" in err_str or "floodwait" in err_str:
+        return "Flood wait limits hit (Temporarily restricted by Telegram due to spam rules)"
+    elif "private" in err_str or "channelprivate" in err_str:
+        return "Group is private or inaccessible (Not a member / invite expired)"
+    elif "peer" in err_str or "invalid" in err_str:
+        return "Group username or ID is invalid/dead"
+    elif "paid" in err_str or "star" in err_str or "paywall" in err_str:
+        return "Paywall enabled (Group requires Stars to send messages)"
+    elif "banned" in err_str:
+        return "Banned from the chat/group"
+    elif "slow_mode" in err_str or "slowmode" in err_str:
+        return "Slow mode is active in this chat"
+    return f"Failed: {str(exception)[:60]}"
+
+# Helper to join a group using Telethon
+async def join_group_via_client(client, link):
+    link = link.strip()
+    if not link:
+        return False
+    try:
+        if "+" in link or "joinchat/" in link:
+            # Private invite
+            hash_val = link.split("+")[-1].strip() if "+" in link else link.split("joinchat/")[-1].strip()
+            hash_val = hash_val.split("/")[0].split("?")[0]
+            await client(ImportChatInviteRequest(hash_val))
+            return True
+        else:
+            # Public username
+            username = link
+            if "t.me/" in link:
+                username = link.split("t.me/")[-1].split("/")[0].split("?")[0]
+            if not username.startswith("@") and not username.isdigit():
+                username = "@" + username
+            await client(JoinChannelRequest(username))
+            return True
+    except Exception as e:
+        logger.error(f"Join failed for {link}: {e}")
+        raise e
 
 # Save the original get_dashboard_markup function
 original_get_dashboard_markup = get_dashboard_markup
@@ -175,10 +222,9 @@ def handle_group_mailer_callbacks(call):
     data = call.data
     chat_id = call.message.chat.id
     message_id = call.message.message_id
-    selected_ub = get_setting("gm_selected_userbot")
+    selected_ubs = json.loads(get_setting("gm_selected_userbots") or "[]")
 
     if data == "group_mailer_main":
-        # Save admin chat ID for background notifications
         set_setting("gm_admin_chat_id", str(chat_id))
         
         interval = int(get_setting("gm_repeat_interval") or "0")
@@ -191,9 +237,9 @@ def handle_group_mailer_callbacks(call):
 
         markup = InlineKeyboardMarkup()
         
-        # Row 1: Select Userbot, Select Msg
+        # Row 1: Select Userbots, Select Msg
         markup.row(
-            InlineKeyboardButton("👤 Select Userbot", callback_data="gm_select_userbot"),
+            InlineKeyboardButton("👤 Select Userbots", callback_data="gm_select_userbot"),
             InlineKeyboardButton("💬 Select Msg", callback_data="gm_select_msg")
         )
         
@@ -203,8 +249,9 @@ def handle_group_mailer_callbacks(call):
             InlineKeyboardButton(rep_btn_text, callback_data="gm_repeat_menu")
         )
         
-        # Row 3: Start Operation
+        # Row 3: Import Join Links, Start Operation
         markup.row(
+            InlineKeyboardButton("🔗 Import Join Links", callback_data="gm_import_links"),
             InlineKeyboardButton("🚀 Start Operation", callback_data="gm_start_op")
         )
         
@@ -238,42 +285,49 @@ def handle_group_mailer_callbacks(call):
 
         markup = InlineKeyboardMarkup(row_width=1)
         for client in connected_clients:
+            c_id = client._me.id
+            is_selected = c_id in selected_ubs
+            checkbox = "✅" if is_selected else "⬜"
+            
             first_name = client._me.first_name if hasattr(client, '_me') and client._me else "Userbot"
             username = f"@{client._me.username}" if hasattr(client, '_me') and client._me and client._me.username else ""
-            markup.add(InlineKeyboardButton(f"👤 {first_name} {username}", callback_data=f"gm_set_ub_{client._me.id}"))
+            
+            markup.add(InlineKeyboardButton(f"{checkbox} {first_name} {username}", callback_data=f"gm_tglub_{c_id}"))
         
-        markup.add(InlineKeyboardButton("🔙 Back", callback_data="group_mailer_main"))
+        markup.add(InlineKeyboardButton("🔙 Done / Back", callback_data="group_mailer_main"))
         bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
-            text="👤 *Select Userbot to use for broadcast:*",
+            text="👤 *Select Userbots to use for broadcast (Multiple selection enabled):*",
             reply_markup=markup,
             parse_mode="Markdown"
         )
 
-    elif data.startswith("gm_set_ub_"):
-        ub_id = data.split("_")[-1]
-        set_setting("gm_selected_userbot", ub_id)
-        set_setting("gm_selected_group_ids", "[]")
-        if ub_id in userbot_groups_cache:
-            del userbot_groups_cache[ub_id]
+    elif data.startswith("gm_tglub_"):
+        ub_id = int(data.split("_")[-1])
+        if ub_id in selected_ubs:
+            selected_ubs.remove(ub_id)
+        else:
+            selected_ubs.append(ub_id)
             
-        bot.answer_callback_query(call.id, "✅ Userbot selected! Target groups reset.")
-        handle_group_mailer_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': 'group_mailer_main', 'message': call.message, 'id': call.id})())
+        set_setting("gm_selected_userbots", json.dumps(selected_ubs))
+        bot.answer_callback_query(call.id, "Preference updated!")
+        handle_group_mailer_callbacks(type('MockCall', (object,), {'from_user': call.from_user, 'data': 'gm_select_userbot', 'message': call.message, 'id': call.id})())
 
     elif data == "gm_groups_list":
-        if not selected_ub:
-            bot.answer_callback_query(call.id, "⚠️ Please select a Userbot first!", show_alert=True)
+        if not selected_ubs:
+            bot.answer_callback_query(call.id, "⚠️ Please select at least one Userbot first!", show_alert=True)
             return
 
-        client = userbot_fleet_manager.get_client(int(selected_ub))
+        primary_ub = str(selected_ubs[0])
+        client = userbot_fleet_manager.get_client(int(primary_ub))
         if not client or not client.is_connected():
-            bot.answer_callback_query(call.id, "❌ Selected userbot is offline or disconnected!", show_alert=True)
+            bot.answer_callback_query(call.id, "❌ Primary userbot is offline or disconnected!", show_alert=True)
             return
 
         bot.answer_callback_query(call.id, "⏳ Loading groups...")
-        if selected_ub in userbot_groups_cache:
-            show_groups_page(chat_id, message_id, selected_ub, page=0)
+        if primary_ub in userbot_groups_cache:
+            show_groups_page(chat_id, message_id, primary_ub, page=0)
         else:
             bot.edit_message_text(
                 chat_id=chat_id,
@@ -282,18 +336,19 @@ def handle_group_mailer_callbacks(call):
                 parse_mode="Markdown"
             )
             def on_fetch_done(fut):
-                show_groups_page(chat_id, message_id, selected_ub, page=0)
+                show_groups_page(chat_id, message_id, primary_ub, page=0)
             
-            future = asyncio.run_coroutine_threadsafe(fetch_dialogs_async(client, selected_ub), loop)
+            future = asyncio.run_coroutine_threadsafe(fetch_dialogs_async(client, primary_ub), loop)
             future.add_done_callback(on_fetch_done)
 
     elif data.startswith("gm_refresh_"):
         page = int(data.split("_")[-1])
-        if not selected_ub:
+        if not selected_ubs:
             bot.answer_callback_query(call.id, "❌ Userbot is not selected!")
             return
             
-        client = userbot_fleet_manager.get_client(int(selected_ub))
+        primary_ub = str(selected_ubs[0])
+        client = userbot_fleet_manager.get_client(int(primary_ub))
         if not client or not client.is_connected():
             bot.answer_callback_query(call.id, "❌ Selected userbot is offline!", show_alert=True)
             return
@@ -306,19 +361,19 @@ def handle_group_mailer_callbacks(call):
             parse_mode="Markdown"
         )
         
-        # Clear cache and trigger fresh download
-        if selected_ub in userbot_groups_cache:
-            del userbot_groups_cache[selected_ub]
+        if primary_ub in userbot_groups_cache:
+            del userbot_groups_cache[primary_ub]
             
         def on_sync_done(fut):
-            show_groups_page(chat_id, message_id, selected_ub, page)
+            show_groups_page(chat_id, message_id, primary_ub, page)
             
-        future = asyncio.run_coroutine_threadsafe(fetch_dialogs_async(client, selected_ub), loop)
+        future = asyncio.run_coroutine_threadsafe(fetch_dialogs_async(client, primary_ub), loop)
         future.add_done_callback(on_sync_done)
 
     elif data.startswith("gm_page_"):
         page = int(data.split("_")[-1])
-        show_groups_page(chat_id, message_id, selected_ub, page)
+        primary_ub = str(selected_ubs[0])
+        show_groups_page(chat_id, message_id, primary_ub, page)
         bot.answer_callback_query(call.id)
 
     elif data.startswith("gm_tgl_"):
@@ -333,25 +388,28 @@ def handle_group_mailer_callbacks(call):
             selected_ids.append(g_id)
             
         set_setting("gm_selected_group_ids", json.dumps(selected_ids))
-        show_groups_page(chat_id, message_id, selected_ub, page)
+        primary_ub = str(selected_ubs[0])
+        show_groups_page(chat_id, message_id, primary_ub, page)
         bot.answer_callback_query(call.id)
 
     elif data.startswith("gm_all_sel_"):
         page = int(data.split("_")[-1])
-        groups = userbot_groups_cache.get(selected_ub, [])
+        primary_ub = str(selected_ubs[0])
+        groups = userbot_groups_cache.get(primary_ub, [])
         selected_ids = set(json.loads(get_setting("gm_selected_group_ids") or "[]"))
         
         for g in groups:
             selected_ids.add(g["id"])
             
         set_setting("gm_selected_group_ids", json.dumps(list(selected_ids)))
-        show_groups_page(chat_id, message_id, selected_ub, page)
+        show_groups_page(chat_id, message_id, primary_ub, page)
         bot.answer_callback_query(call.id, "✅ Selected all groups!")
 
     elif data.startswith("gm_all_clr_"):
         page = int(data.split("_")[-1])
+        primary_ub = str(selected_ubs[0])
         set_setting("gm_selected_group_ids", "[]")
-        show_groups_page(chat_id, message_id, selected_ub, page)
+        show_groups_page(chat_id, message_id, primary_ub, page)
         bot.answer_callback_query(call.id, "🗑 Cleared all selections!")
 
     elif data == "gm_select_msg":
@@ -360,6 +418,20 @@ def handle_group_mailer_callbacks(call):
             chat_id,
             "💬 *SET MAILER MESSAGE*\n\n"
             "Please send or forward the message you want to broadcast (can be text, photo, video, or document with captions)."
+        )
+        bot.answer_callback_query(call.id)
+
+    elif data == "gm_import_links":
+        if not selected_ubs:
+            bot.answer_callback_query(call.id, "❌ Please select at least one Userbot first!", show_alert=True)
+            return
+            
+        admin_states[uid] = "awaiting_gm_links"
+        bot.send_message(
+            chat_id,
+            "🔗 *IMPORT GROUP JOIN LINKS*\n\n"
+            "Please send your group links (invite links or usernames, one per line).\n"
+            "Example:\n`t.me/+invitehash`\n`@my_group`"
         )
         bot.answer_callback_query(call.id)
 
@@ -400,8 +472,8 @@ def handle_group_mailer_callbacks(call):
         selected_groups = json.loads(get_setting("gm_selected_group_ids") or "[]")
         msg_data = json.loads(get_setting("gm_message") or "{}")
 
-        if not selected_ub:
-            bot.answer_callback_query(call.id, "❌ Please select a Userbot first!", show_alert=True)
+        if not selected_ubs:
+            bot.answer_callback_query(call.id, "❌ Please select at least one Userbot first!", show_alert=True)
             return
         if not selected_groups:
             bot.answer_callback_query(call.id, "❌ Please select target groups first!", show_alert=True)
@@ -410,68 +482,135 @@ def handle_group_mailer_callbacks(call):
             bot.answer_callback_query(call.id, "❌ Please set the mailer message first!", show_alert=True)
             return
 
-        client = userbot_fleet_manager.get_client(int(selected_ub))
-        if not client or not client.is_connected():
-            bot.answer_callback_query(call.id, "❌ Selected userbot is offline or disconnected!", show_alert=True)
-            return
-
         bot.answer_callback_query(call.id, "🚀 Starting operation...")
-        # Dispatch the task safely to the main event loop thread
         asyncio.run_coroutine_threadsafe(
-            run_broadcast(client, selected_groups, msg_data, chat_id),
+            run_broadcast_failover(selected_ubs, selected_groups, msg_data, chat_id),
             loop
         )
 
 # Intercept message state inputs for Group Mailer
-@bot.message_handler(func=lambda m: is_authorized_manager(m.from_user.id) and admin_states.get(m.from_user.id) == "awaiting_gm_message")
+@bot.message_handler(func=lambda m: is_authorized_manager(m.from_user.id) and admin_states.get(m.from_user.id) in ["awaiting_gm_message", "awaiting_gm_links"])
 def handle_mailer_states(message):
     uid = message.from_user.id
     chat_id = message.chat.id
+    state = admin_states.get(uid)
 
-    msg_type = "text"
-    file_id = None
-    caption = message.caption or ""
-    local_path = None
+    if state == "awaiting_gm_message":
+        msg_type = "text"
+        file_id = None
+        caption = message.caption or ""
+        local_path = None
 
-    if message.photo:
-        msg_type = "photo"
-        file_id = message.photo[-1].file_id
-    elif message.video:
-        msg_type = "video"
-        file_id = message.video.file_id
-    elif message.document:
-        msg_type = "document"
-        file_id = message.document.file_id
+        if message.photo:
+            msg_type = "photo"
+            file_id = message.photo[-1].file_id
+        elif message.video:
+            msg_type = "video"
+            file_id = message.video.file_id
+        elif message.document:
+            msg_type = "document"
+            file_id = message.document.file_id
 
-    if file_id:
-        try:
-            msg_status = bot.reply_to(message, "⏳ Downloading media locally...")
-            file_info = bot.get_file(file_id)
-            downloaded_file = bot.download_file(file_info.file_path)
+        if file_id:
+            try:
+                msg_status = bot.reply_to(message, "⏳ Downloading media locally...")
+                file_info = bot.get_file(file_id)
+                downloaded_file = bot.download_file(file_info.file_path)
+                
+                ext = file_info.file_path.split(".")[-1]
+                local_path = os.path.join(MEDIA_DIR, f"mailer_media_{uid}.{ext}")
+                
+                with open(local_path, "wb") as f:
+                    f.write(downloaded_file)
+                bot.delete_message(chat_id, msg_status.message_id)
+            except Exception as e:
+                bot.reply_to(message, f"❌ Media download failed: {e}")
+                return
+
+        msg_data = {
+            "type": msg_type,
+            "text": message.text or "",
+            "caption": caption,
+            "local_path": local_path
+        }
+        
+        set_setting("gm_message", json.dumps(msg_data))
+        admin_states[uid] = None
+        bot.reply_to(message, f"✅ *Mailer Message Saved!* (Type: `{msg_type.upper()}`)", parse_mode="Markdown")
+
+    elif state == "awaiting_gm_links":
+        text = message.text or ""
+        lines = [line.strip() for line in text.split("\n") if line.strip()]
+        
+        # Get active userbot to resolve invite links
+        selected_ubs = json.loads(get_setting("gm_selected_userbots") or "[]")
+        if not selected_ubs:
+            bot.reply_to(message, "❌ Please select at least one userbot first to process links.")
+            return
             
-            ext = file_info.file_path.split(".")[-1]
-            local_path = os.path.join(MEDIA_DIR, f"mailer_media_{uid}.{ext}")
-            
-            with open(local_path, "wb") as f:
-                f.write(downloaded_file)
-            bot.delete_message(chat_id, msg_status.message_id)
-        except Exception as e:
-            bot.reply_to(message, f"❌ Media download failed: {e}")
+        client = userbot_fleet_manager.get_client(int(selected_ubs[0]))
+        if not client or not client.is_connected():
+            bot.reply_to(message, "❌ Selected primary userbot is offline. Cannot check invite links.")
             return
 
-    msg_data = {
-        "type": msg_type,
-        "text": message.text or "",
-        "caption": caption,
-        "local_path": local_path
-    }
-    
-    set_setting("gm_message", json.dumps(msg_data))
-    admin_states[uid] = None
-    bot.reply_to(message, f"✅ *Mailer Message Saved!* (Type: `{msg_type.upper()}`)", parse_mode="Markdown")
+        bot.reply_to(message, "⏳ Processing and resolving join links...")
+        
+        # Read existing map
+        links_map = json.loads(get_setting("gm_group_links_map") or "{}")
+        selected_groups = json.loads(get_setting("gm_selected_group_ids") or "[]")
+        
+        success_count = 0
+        
+        async def resolve_links_task():
+            nonlocal success_count
+            for line in lines:
+                try:
+                    group_id = None
+                    if "+" in line or "joinchat/" in line:
+                        # Private invite
+                        hash_val = line.split("+")[-1].strip() if "+" in line else line.split("joinchat/")[-1].strip()
+                        hash_val = hash_val.split("/")[0].split("?")[0]
+                        invite_info = await client(CheckChatInviteRequest(hash_val))
+                        if hasattr(invite_info, 'chat'):
+                            group_id = invite_info.chat.id
+                    else:
+                        # Public username
+                        username = line
+                        if "t.me/" in line:
+                            username = line.split("t.me/")[-1].split("/")[0].split("?")[0]
+                        if not username.startswith("@") and not username.isdigit():
+                            username = "@" + username
+                        entity = await client.get_entity(username)
+                        group_id = entity.id
 
-# Asynchronous broadcast implementation (Modified to support dynamic updates mid-operation)
-async def run_broadcast(client, initial_group_ids, msg_data, chat_id, is_auto=False):
+                    if group_id:
+                        # Convert to standard Telethon integer representation (make sure it has -100 prefix if supergroup)
+                        final_id = int(group_id)
+                        # Avoid raw peer mismatch: Telethon handles IDs as standard negative integers
+                        if str(final_id).startswith("-") or final_id > 0:
+                            pass # standard format
+                        
+                        # Store in map
+                        links_map[str(final_id)] = line
+                        if final_id not in selected_groups:
+                            selected_groups.append(final_id)
+                        success_count += 1
+                except Exception as e:
+                    logger.error(f"Error resolving line {line}: {e}")
+
+            set_setting("gm_group_links_map", json.dumps(links_map))
+            set_setting("gm_selected_group_ids", json.dumps(selected_groups))
+            admin_states[uid] = None
+            bot.send_message(
+                chat_id,
+                f"✅ *Links Processed!*\nSuccessfully resolved and added `{success_count}` groups to your selections.",
+                parse_mode="Markdown"
+            )
+
+        asyncio.run_coroutine_threadsafe(resolve_links_task(), loop)
+
+# Asynchronous broadcast implementation with Auto-Join and Failover
+async def run_broadcast_failover(ub_ids, initial_group_ids, msg_data, chat_id, is_auto=False):
     success = 0
     failed = 0
     
@@ -489,35 +628,118 @@ async def run_broadcast(client, initial_group_ids, msg_data, chat_id, is_auto=Fa
     
     # Store processed IDs in this run
     sent_group_ids = set()
+    
+    # Keep track of detailed failures for reporting
+    failed_details = []
+
+    # Map to resolve group title from cached groups
+    group_titles = {}
+    for ub_id in ub_ids:
+        for g in userbot_groups_cache.get(str(ub_id), []):
+            group_titles[g["id"]] = g["title"]
 
     while True:
-        # 1. Fetch live selected groups from DB settings on EVERY iteration
+        # Fetch live settings on EVERY iteration
         live_group_ids = json.loads(get_setting("gm_selected_group_ids") or "[]")
+        links_map = json.loads(get_setting("gm_group_links_map") or "{}")
         
-        # 2. Determine which selected groups haven't been processed yet
+        # Determine which selected groups haven't been processed yet
         remaining_groups = [g for g in live_group_ids if g not in sent_group_ids]
         
-        # 3. If there are no more remaining selected groups, end the operation
         if not remaining_groups:
             break
             
-        # 4. Process the next group
         group_id = remaining_groups[0]
         sent_group_ids.add(group_id)
         
-        try:
-            msg_type = msg_data.get("type")
-            if msg_type == "text":
-                await client.send_message(group_id, msg_data["text"])
-            elif msg_type in ["photo", "video", "document"]:
-                await client.send_file(group_id, msg_data["local_path"], caption=msg_data.get("caption", ""))
-                
-            success += 1
-        except Exception as e:
-            failed += 1
-            logger.error(f"Group Mailer error sending to {group_id}: {e}")
+        group_sent_successfully = False
+        group_errors = []
 
-        # 5. Live progress updates based on the current live count
+        # Failover send loop across all selected userbots in order
+        for ub_id in ub_ids:
+            client = userbot_fleet_manager.get_client(int(ub_id))
+            if not client or not client.is_connected():
+                group_errors.append((ub_id, "Userbot client is offline or disconnected"))
+                continue
+
+            try:
+                entity = group_id
+                
+                # Resolve entity for target
+                try:
+                    if isinstance(group_id, str) and group_id.startswith("@"):
+                        entity = await client.get_entity(group_id)
+                    elif isinstance(group_id, str) and group_id.isdigit():
+                        entity = int(group_id)
+                except Exception as ent_err:
+                    # If entity resolution fails (e.g. peer not found because userbot is not in the group),
+                    # attempt to auto-join using the link from links_map
+                    join_link = links_map.get(str(group_id))
+                    if join_link:
+                        try:
+                            # Auto-join group
+                            await join_group_via_client(client, join_link)
+                            # Wait 5 to 10 seconds random delay after joining
+                            join_wait = random.randint(5, 10)
+                            await asyncio.sleep(join_wait)
+                            # Re-resolve entity
+                            entity = group_id
+                            if isinstance(group_id, str) and group_id.startswith("@"):
+                                entity = await client.get_entity(group_id)
+                            elif isinstance(group_id, str) and group_id.isdigit():
+                                entity = int(group_id)
+                        except Exception as join_err:
+                            raise Exception(f"Auto-join failed: {join_err}")
+                    else:
+                        raise ent_err
+
+                msg_type = msg_data.get("type")
+                if msg_type == "text":
+                    await client.send_message(entity, msg_data["text"])
+                elif msg_type in ["photo", "video", "document"]:
+                    await client.send_file(entity, msg_data["local_path"], caption=msg_data.get("caption", ""))
+                
+                group_sent_successfully = True
+                break # Success! Exit failover loop for this group
+            except Exception as e:
+                # If exception is a result of not being in group (e.g. ChatWriteForbidden or PeerIdInvalid),
+                # try to auto-join using the join link if we haven't already attempted it above.
+                try:
+                    join_link = links_map.get(str(group_id))
+                    if join_link and "auto-join failed" not in str(e).lower():
+                        # Try to join the group
+                        await join_group_via_client(client, join_link)
+                        # Wait 5 to 10 seconds random delay after joining
+                        join_wait = random.randint(5, 10)
+                        await asyncio.sleep(join_wait)
+                        
+                        # Re-send message
+                        msg_type = msg_data.get("type")
+                        if msg_type == "text":
+                            await client.send_message(entity, msg_data["text"])
+                        elif msg_type in ["photo", "video", "document"]:
+                            await client.send_file(entity, msg_data["local_path"], caption=msg_data.get("caption", ""))
+                        
+                        group_sent_successfully = True
+                        break # Success! Exit failover loop for this group
+                except Exception as retry_err:
+                    e = retry_err
+                
+                group_errors.append((ub_id, e))
+                logger.warning(f"Userbot {ub_id} failed to send to {group_id}: {e}")
+        
+        if group_sent_successfully:
+            success += 1
+        else:
+            failed += 1
+            g_title = group_titles.get(group_id, f"ID: {group_id}")
+            report_lines = [f"❌ *Group:* `{g_title}`"]
+            for ub_id, err in group_errors:
+                friendly_desc = get_friendly_error(err)
+                report_lines.append(f"  ⚠️ *UB {ub_id}:* {friendly_desc}")
+            failed_details.append("\n".join(report_lines))
+
+        # Live progress updates
         total_groups = len(live_group_ids)
         processed_count = len(sent_group_ids)
         
@@ -527,7 +749,7 @@ async def run_broadcast(client, initial_group_ids, msg_data, chat_id, is_auto=Fa
                 bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=progress_msg.message_id,
-                    text=f"⏳ *{label} progress:* `{pct}%` (Success: `{success}`, Failed: `{failed}` | Total Selected: `{total_groups}`)",
+                    text=f"⏳ *{label} progress:* `{pct}%` (Success: `{success}`, Failed: `{failed}` | Total: `{total_groups}`)",
                     parse_mode="Markdown"
                 )
             except Exception:
@@ -547,6 +769,23 @@ async def run_broadcast(client, initial_group_ids, msg_data, chat_id, is_auto=Fa
         except Exception:
             pass
 
+    # Send Detailed Failure Report
+    if failed_details and chat_id:
+        try:
+            header = f"🚨 *Group Mailer Failure Report:*\nThe message could not be sent to the following groups on all selected accounts:\n\n"
+            current_message = header
+            
+            for report in failed_details:
+                if len(current_message) + len(report) + 2 > 4000:
+                    bot.send_message(chat_id, current_message, parse_mode="Markdown")
+                    current_message = ""
+                current_message += report + "\n\n"
+                
+            if current_message.strip():
+                bot.send_message(chat_id, current_message, parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Error sending failure report: {e}")
+
 # Background Scheduled Supervisor Loop
 async def scheduler_loop():
     logger.info("⏰ Group Mailer background scheduler loop running...")
@@ -557,20 +796,23 @@ async def scheduler_loop():
                 last_run = float(get_setting("gm_last_run") or "0")
                 now = time.time()
                 
-                # Check if it is time to run
                 if now - last_run >= (interval_minutes * 60):
-                    selected_ub = get_setting("gm_selected_userbot")
+                    selected_ubs = json.loads(get_setting("gm_selected_userbots") or "[]")
                     selected_groups = json.loads(get_setting("gm_selected_group_ids") or "[]")
                     msg_data = json.loads(get_setting("gm_message") or "{}")
                     
-                    if selected_ub and selected_groups and msg_data:
-                        client = userbot_fleet_manager.get_client(int(selected_ub))
-                        if client and client.is_connected():
+                    if selected_ubs and selected_groups and msg_data:
+                        has_active_client = False
+                        for ub_id in selected_ubs:
+                            client = userbot_fleet_manager.get_client(int(ub_id))
+                            if client and client.is_connected():
+                                has_active_client = True
+                                break
+                                
+                        if has_active_client:
                             admin_chat_id = get_setting("gm_admin_chat_id")
                             dest_chat = int(admin_chat_id) if admin_chat_id else None
-                            
-                            # Execute broadcast asynchronously on loop thread
-                            await run_broadcast(client, selected_groups, msg_data, dest_chat, is_auto=True)
+                            await run_broadcast_failover(selected_ubs, selected_groups, msg_data, dest_chat, is_auto=True)
         except Exception as e:
             logger.error(f"Error in Group Mailer scheduler loop: {e}")
             
